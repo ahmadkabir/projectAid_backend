@@ -1,0 +1,40 @@
+{
+  "name": "projectaid-backend",
+  "version": "1.0.0",
+  "description": "Backend API for ProjectAid MVP",
+  "main": "src/app.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "nodemon src/app.js",
+    "migrate": "node src/config/migrate.js",
+    "migrate:category": "node src/config/migrateAddCategory.js",
+    "migrate:set-documentation": "node src/config/migrateSetAllDocumentation.js",
+    "migrate:level-institution": "node src/config/migrateAddLevelInstitution.js",
+    "migrate:project-documents": "node src/config/migrateAddProjectDocuments.js",
+    "seed": "node src/config/seed.js",
+    "generate-files": "node src/utils/generateMockFiles.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.5",
+    "express-validator": "^7.0.1",
+    "helmet": "^7.1.0",
+    "html-docx-js": "^1.0.6",
+    "html-pdf": "^3.0.1",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^1.4.5-lts.1",
+    "mysql2": "^3.6.5",
+    "openai": "^6.16.0",
+    "sequelize": "^6.35.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
