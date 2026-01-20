@@ -1,5 +1,6 @@
 import { validationResult } from 'express-validator';
-import { Order, OrderItem, Project, ProjectCategory } from '../models/index.js';
+import { Op } from 'sequelize';
+import { Order, OrderItem, Project, ProjectCategory, User } from '../models/index.js';
 
 export const createOrder = async (req, res) => {
   try {
@@ -17,7 +18,6 @@ export const createOrder = async (req, res) => {
     let totalAmount = 0;
     const orderItems = [];
 
-    // Calculate total and validate items
     for (const item of items) {
       const project = await Project.findByPk(item.projectId);
       if (!project) {
@@ -41,14 +41,12 @@ export const createOrder = async (req, res) => {
       orderItems.push({ projectId: item.projectId, itemType: item.itemType, price });
     }
 
-    // Create order
     const order = await Order.create({
       userId: req.user.id,
       totalAmount,
       status: 'pending'
     });
 
-    // Create order items
     for (const item of orderItems) {
       await OrderItem.create({
         orderId: order.id,
@@ -85,14 +83,11 @@ export const createOrder = async (req, res) => {
 
 export const processPayment = async (req, res) => {
   try {
-    const orderId = req.params.id; // Get order ID from URL parameter
+    const orderId = req.params.id;
     const { paymentMethod, transactionId } = req.body;
 
     const order = await Order.findByPk(orderId, {
-      include: [{
-        model: OrderItem,
-        as: 'items'
-      }]
+      include: [{ model: OrderItem, as: 'items' }]
     });
 
     if (!order) {
@@ -107,8 +102,6 @@ export const processPayment = async (req, res) => {
       return res.status(400).json({ message: 'Order already processed' });
     }
 
-    // Mock payment processing - in production, integrate with payment gateway
-    // For MVP, we'll simulate successful payment
     order.status = 'completed';
     order.paymentMethod = paymentMethod || 'mock_payment';
     order.transactionId = transactionId || `TXN-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -167,26 +160,62 @@ export const getUserOrders = async (req, res) => {
 
 export const getAllOrders = async (req, res) => {
   try {
-    const orders = await Order.findAll({
+    const { page = 1, limit = 10, search = '', startDate, endDate } = req.query;
+
+    const where = {};
+    if (startDate || endDate) {
+      where.createdAt = {};
+      if (startDate) where.createdAt[Op.gte] = new Date(startDate);
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        where.createdAt[Op.lte] = end;
+      }
+    }
+
+    const include = [{
+      model: OrderItem,
+      as: 'items',
+      required: false,
       include: [{
-        model: OrderItem,
-        as: 'items',
-        include: [{
-          model: Project,
-          as: 'project',
-          include: [{
-            model: ProjectCategory,
-            as: 'category'
-          }]
-        }]
-      }],
-      order: [['createdAt', 'DESC']]
+        model: Project,
+        as: 'project',
+        required: false,
+        include: [{ model: ProjectCategory, as: 'category' }]
+      }]
+    }, {
+      model: User,
+      as: 'user',
+      attributes: ['id', 'name', 'email'],
+      required: false
+    }];
+
+    const searchConditions = [];
+    if (search) {
+      const like = { [Op.like]: `%${search}%` };
+      searchConditions.push(
+        { transactionId: like },
+        { '$user.name$': like },
+        { '$user.email$': like },
+        { '$items.project.title$': like }
+      );
+    }
+
+    const finalWhere = searchConditions.length ? { ...where, [Op.or]: searchConditions } : where;
+
+    const { count, rows } = await Order.findAndCountAll({
+      where: finalWhere,
+      include,
+      order: [['createdAt', 'DESC']],
+      limit: parseInt(limit, 10),
+      offset: (parseInt(page, 10) - 1) * parseInt(limit, 10),
+      distinct: true
     });
 
-    res.json({ orders });
+    res.json({ success: true, orders: rows, total: count });
   } catch (error) {
     console.error('Get all orders error:', error);
-    res.status(500).json({ message: 'Server error' });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 };
 

@@ -38,95 +38,125 @@ const normalizeProject = (project) => {
 
 export const getAllProjects = async (req, res) => {
   try {
-    const { category, search, status, type, projectType } = req.query;
-    const where = {};
+    const {
+      category,
+      search = '',
+      status = 'all',
+      type,
+      projectType,
+      startDate,
+      endDate,
+      page,
+      limit
+    } = req.query;
 
-    // Only filter by status if explicitly provided and not 'all' or empty
+    const baseWhere = {};
+
     if (status && status !== 'all' && status !== '') {
-      where.status = status;
-    }
-    // If status is not provided, empty, or 'all', don't filter by status (return all)
-
-    if (category) {
-      where.categoryId = category;
+      baseWhere.status = status;
     }
 
-    // Filter by projectType (accept both 'type' and 'projectType' query params)
-    const requestedType = (type || projectType)?.toLowerCase().trim();
-    const projectTypeConditions = [];
-    
+    if (category && category !== 'all') {
+      baseWhere.categoryId = category;
+    }
+
+    if (startDate || endDate) {
+      baseWhere.createdAt = {};
+      if (startDate) {
+        baseWhere.createdAt[Op.gte] = new Date(startDate);
+      }
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        baseWhere.createdAt[Op.lte] = end;
+      }
+    }
+
+    const requestedType = (type || projectType)?.toLowerCase()?.trim();
+    const typeConditions = [];
+
     if (requestedType) {
-      // Database only supports 'documentation' and 'software'
-      // 'full' is not a valid projectType in the database schema
-      if (requestedType === 'full') {
-        // 'full' projects don't exist in current schema - return empty result
-        console.log(`Filter requested for 'full' projects. No projects match (projectType only supports 'documentation' or 'software').`);
-        return res.json({ projects: [] });
-      }
-      
-      // Validate and normalize projectType values
       const validTypes = ['documentation', 'software'];
-      if (validTypes.includes(requestedType)) {
-        // Strict filtering based on projectType
-        if (requestedType === 'documentation') {
-          // Include both 'documentation' and NULL (NULL will be normalized to 'documentation' in response)
-          projectTypeConditions.push(
-            { projectType: 'documentation' },
-            { projectType: null }
-          );
-        } else if (requestedType === 'software') {
-          // Only return projects explicitly marked as 'software'
-          // NULL values are excluded (they're treated as documentation)
-          where.projectType = 'software';
-        }
-      } else {
-        // Invalid type requested - return empty result
-        console.warn(`Invalid projectType filter requested: ${requestedType}. Valid values are 'documentation' or 'software'. Returning empty result.`);
-        return res.json({ projects: [] });
+      if (!validTypes.includes(requestedType)) {
+        console.warn('Invalid projectType filter requested: ' + requestedType + ". Valid values are 'documentation' or 'software'. Returning empty result.");
+        return res.json({ success: true, projects: [], total: 0 });
+      }
+
+      if (requestedType === 'documentation') {
+        typeConditions.push({ projectType: 'documentation' }, { projectType: null });
+      } else if (requestedType === 'software') {
+        baseWhere.projectType = 'software';
       }
     }
 
-    // Handle search filter
     const searchConditions = [];
     if (search) {
+      const like = { [Op.like]: `%${search}%` };
       searchConditions.push(
-        { title: { [Op.like]: `%${search}%` } },
-        { description: { [Op.like]: `%${search}%` } }
+        { title: like },
+        { description: like },
+        { '$category.name$': like }
       );
     }
 
-    // Combine projectType and search conditions properly
-    if (projectTypeConditions.length > 0 && searchConditions.length > 0) {
-      // Both filters exist - use Op.and to combine them
-      where[Op.and] = [
-        { [Op.or]: projectTypeConditions },
-        { [Op.or]: searchConditions }
-      ];
-    } else if (projectTypeConditions.length > 0) {
-      // Only projectType filter
-      where[Op.or] = projectTypeConditions;
-    } else if (searchConditions.length > 0) {
-      // Only search filter
-      where[Op.or] = searchConditions;
+    const andConditions = [];
+    if (typeConditions.length > 0) {
+      andConditions.push({ [Op.or]: typeConditions });
+    }
+    if (searchConditions.length > 0) {
+      andConditions.push({ [Op.or]: searchConditions });
     }
 
-    const projects = await Project.findAll({
-      where,
-      include: [{
-        model: ProjectCategory,
-        as: 'category',
-        attributes: ['id', 'name']
-      }],
-      order: [['createdAt', 'DESC']]
-    });
+    const finalWhere = { ...baseWhere };
+    if (andConditions.length > 0) {
+      finalWhere[Op.and] = andConditions;
+    }
 
-    // Normalize projects to ensure projectType defaults to 'documentation'
+    const include = [{
+      model: ProjectCategory,
+      as: 'category',
+      attributes: ['id', 'name']
+    }];
+
+    const pageNumber = page ? parseInt(page, 10) : null;
+    const pageSize = limit ? parseInt(limit, 10) : 10;
+    const shouldPaginate = Number.isInteger(pageNumber) && pageNumber > 0;
+
+    let projects;
+    let total = 0;
+    let pagination;
+
+    if (shouldPaginate) {
+      const { rows, count } = await Project.findAndCountAll({
+        where: finalWhere,
+        include,
+        order: [['createdAt', 'DESC']],
+        limit: pageSize,
+        offset: (pageNumber - 1) * pageSize
+      });
+      projects = rows;
+      total = count;
+      pagination = { page: pageNumber, pageSize, total };
+    } else {
+      projects = await Project.findAll({
+        where: finalWhere,
+        include,
+        order: [['createdAt', 'DESC']]
+      });
+      total = projects.length;
+    }
+
     const normalizedProjects = projects.map(normalizeProject);
 
-    res.json({ projects: normalizedProjects });
+    res.json({
+      success: true,
+      projects: normalizedProjects,
+      total,
+      ...(pagination ? { pagination } : {})
+    });
   } catch (error) {
     console.error('Get projects error:', error);
-    res.status(500).json({ message: 'Server error' });
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 };
 
@@ -479,3 +509,4 @@ export const createCategory = async (req, res) => {
     res.status(500).json({ message: 'Server error creating category' });
   }
 };
+
