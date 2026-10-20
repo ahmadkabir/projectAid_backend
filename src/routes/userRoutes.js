@@ -4,11 +4,41 @@ import {
   getAllUsers,
   getUserById,
   updateUser,
-  deleteUser
+  deleteUser,
+  getProfile,
+  updateProfile,
+  changePassword
 } from '../controllers/userController.js';
 import { authenticate, authorize } from '../middlewares/auth.js';
 
 const router = express.Router();
+
+// Self-service profile routes — declared before '/:id' so 'profile' is never
+// treated as a user id. Any authenticated user may manage their own profile;
+// role changes are intentionally not possible here (admin-only via PUT /:id).
+router.get('/profile', authenticate, getProfile);
+
+router.put(
+  '/profile',
+  authenticate,
+  [
+    body('name').optional().trim().notEmpty().withMessage('Name cannot be empty'),
+    body('email').optional().isEmail().withMessage('Valid email is required')
+  ],
+  updateProfile
+);
+
+router.put(
+  '/profile/password',
+  authenticate,
+  [
+    body('currentPassword').notEmpty().withMessage('Current password is required'),
+    body('newPassword')
+      .isLength({ min: 6 })
+      .withMessage('Password must be at least 6 characters')
+  ],
+  changePassword
+);
 
 router.get('/', authenticate, authorize('admin'), getAllUsers);
 router.get('/:id', authenticate, authorize('admin'), getUserById);

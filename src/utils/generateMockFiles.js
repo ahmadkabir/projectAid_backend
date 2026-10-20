@@ -1,7 +1,8 @@
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { mockProjects, generateFileName } from '../config/mockProjects.js';
+import { courseBasedProjects } from '../config/courseBasedProjects.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -161,7 +162,8 @@ export async function generateAllMockFiles() {
     }
   });
 
-  for (const project of mockProjects) {
+  // Cover both project lists: mockProjects (npm seed used courseBasedProjects)
+  for (const project of [...mockProjects, ...courseBasedProjects]) {
     // Generate PDF if documentation price > 0
     if (project.documentationPrice > 0) {
       const pdfFileName = generateFileName(project.title, 'documentation');
@@ -189,9 +191,13 @@ export async function generateAllMockFiles() {
     // Generate placeholder thumbnail
     const thumbFileName = generateFileName(project.title, 'thumbnail');
     const thumbPath = path.join(thumbnailDir, thumbFileName);
-    // Create a simple placeholder (in production, generate actual image)
-    const thumbContent = `Placeholder thumbnail for: ${project.title}`;
-    fs.writeFileSync(thumbPath, thumbContent);
+    // Create a valid placeholder PNG (1x1) so browsers can decode it
+    // (a text file named .png renders as a broken image)
+    const placeholderPng = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64'
+    );
+    fs.writeFileSync(thumbPath, placeholderPng);
     console.log(`✓ Generated thumbnail: ${thumbFileName}`);
   }
 
@@ -199,6 +205,7 @@ export async function generateAllMockFiles() {
 }
 
 // Run if called directly
-if (import.meta.url === `file://${process.argv[1]}`) {
+// (argv[1] may be relative, so resolve it before comparing with import.meta.url)
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   generateAllMockFiles().catch(console.error);
 }

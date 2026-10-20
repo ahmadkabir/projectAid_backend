@@ -23,7 +23,12 @@ const __dirname = path.dirname(__filename);
 const app = express();
 
 // Security middleware
-app.use(helmet());
+// crossOriginResourcePolicy: 'cross-origin' so the frontend (localhost:5173)
+// can load images from /uploads served by this API
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  crossOriginEmbedderPolicy: false
+}));
 
 // Rate limiting (more lenient in development)
 const limiter = rateLimit({
@@ -36,8 +41,20 @@ const limiter = rateLimit({
 app.use('/api/', limiter);
 
 // CORS configuration
+// Vite serves on both localhost and 127.0.0.1 — allow both origins
+const allowedOrigins = [
+  process.env.FRONTEND_URL || 'http://localhost:5173',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173'
+];
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  origin: (origin, callback) => {
+    // Allow non-browser tools (no Origin header) and known frontend origins
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    callback(null, false);
+  },
   credentials: true
 }));
 

@@ -19,7 +19,8 @@ async function seed() {
         name: 'Admin User',
         email: 'admin@projectaid.com',
         password: hashedAdminPassword,
-        role: 'admin'
+        role: 'admin',
+        emailVerified: true // seeded accounts are trusted — must login without an inbox
       }
     });
     if (adminCreated) {
@@ -36,7 +37,8 @@ async function seed() {
         name: 'Student User',
         email: 'student@projectaid.com',
         password: hashedStudentPassword,
-        role: 'student'
+        role: 'student',
+        emailVerified: true // seeded accounts are trusted — must login without an inbox
       }
     });
     if (studentCreated) {

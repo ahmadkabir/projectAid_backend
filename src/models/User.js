@@ -33,6 +33,20 @@ const User = sequelize.define('User', {
   role: {
     type: DataTypes.ENUM('student', 'admin'),
     defaultValue: 'student'
+  },
+  emailVerified: {
+    type: DataTypes.BOOLEAN,
+    allowNull: false,
+    defaultValue: false
+  },
+  // SHA-256 hash of the raw verification token (raw token only lives in the email link)
+  verificationToken: {
+    type: DataTypes.STRING,
+    allowNull: true
+  },
+  verificationTokenExpires: {
+    type: DataTypes.DATE,
+    allowNull: true
   }
 }, {
   tableName: 'users',

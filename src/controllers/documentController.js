@@ -420,8 +420,10 @@ const generateDocumentFileName = (title = 'project', format = 'pdf') => {
   return `${sanitizedTitle}_${typeLabel}_${dateString}.${format}`;
 };
 
-const htmlToDocxBuffer = (htmlString) => {
-  return htmlDocx.asBuffer(htmlString);
+const htmlToDocxBuffer = async (htmlString) => {
+  // html-docx-js@0.3.x exposes asBlob (asBuffer only existed in the unpublished 1.x)
+  const blob = htmlDocx.asBlob(htmlString);
+  return Buffer.from(await blob.arrayBuffer());
 };
 
 const htmlToPdfBuffer = (htmlString) => {
@@ -457,7 +459,7 @@ export const saveDocumentFile = async (req, res) => {
     let buffer;
 
     if (format === 'docx') {
-      buffer = htmlToDocxBuffer(formattedHtml);
+      buffer = await htmlToDocxBuffer(formattedHtml);
     } else {
       buffer = await htmlToPdfBuffer(formattedHtml);
     }
