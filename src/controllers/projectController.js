@@ -1,8 +1,9 @@
 import { validationResult } from 'express-validator';
+import jwt from 'jsonwebtoken';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { Project, ProjectCategory, OrderItem, SupportRequest, ProjectDocumentFile } from '../models/index.js';
+import { Project, ProjectCategory, Order, OrderItem, SupportRequest, ProjectDocumentFile, ProjectDocument } from '../models/index.js';
 import { Op } from 'sequelize';
 import { validateProjectData } from '../utils/projectValidation.js';
 
@@ -190,6 +191,169 @@ export const getProjectById = async (req, res) => {
   } catch (error) {
     console.error('Get project error:', error);
     res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// Number of characters of the document a visitor may read before paying.
+// Roughly one A4 page of body text.
+const FREE_SAMPLE_LENGTH = 2200;
+const MAX_LOCKED_SECTIONS = 30;
+
+// Documents are stored as plain text/markdown (`**HEADING**`, `---`, paragraphs)
+const SECTION_TITLE_PATTERNS = [
+  /^\*\*(.+?)\*\*\s*$/,
+  /^#{1,4}\s+(.+)$/,
+  /^(CHAPTER\b.+)$/i
+];
+
+// Cut the free sample at a paragraph boundary so it never ends mid-sentence
+const buildSample = (content) => {
+  if (content.length <= FREE_SAMPLE_LENGTH) {
+    return { sample: content, sampleEnd: content.length };
+  }
+
+  const window = content.slice(0, FREE_SAMPLE_LENGTH);
+  const lastBreak = window.lastIndexOf('\n\n');
+
+  if (lastBreak < FREE_SAMPLE_LENGTH / 2) {
+    return { sample: window.trimEnd(), sampleEnd: window.length };
+  }
+
+  return { sample: window.slice(0, lastBreak).trimEnd(), sampleEnd: lastBreak };
+};
+
+// Section titles from the part that stays locked, so visitors see the shape
+// of the document without any of its content
+const buildLockedSections = (content, sampleEnd) => {
+  const sections = [];
+  const seen = new Set();
+
+  for (const line of content.slice(sampleEnd).split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    for (const pattern of SECTION_TITLE_PATTERNS) {
+      const match = trimmed.match(pattern);
+      if (!match) continue;
+
+      const title = match[1].replace(/\*/g, '').trim();
+      if (title.length < 3 || title.length > 100) continue;
+      if (seen.has(title)) continue;
+
+      seen.add(title);
+      sections.push(title);
+      break;
+    }
+
+    if (sections.length >= MAX_LOCKED_SECTIONS) break;
+  }
+
+  return sections;
+};
+
+/**
+ * Public document preview.
+ *
+ * Visitors get a redacted sample of the project's documentation plus the list
+ * of sections that stay locked until they buy. The full text is only ever
+ * returned to a user with a completed order — the redaction happens here, on
+ * the server, so nothing hidden ever reaches the browser.
+ *
+ * Authentication is optional: a valid token marks the preview as unlocked for
+ * that buyer; without one the same sample is returned with `unlocked: false`.
+ */
+export const getDocumentPreview = async (req, res) => {
+  try {
+    const project = await Project.findByPk(req.params.id, {
+      include: [
+        { model: ProjectCategory, as: 'category', attributes: ['id', 'name'] },
+        {
+          model: ProjectDocumentFile,
+          as: 'documentFiles',
+          attributes: ['id', 'fileName', 'fileType', 'filePath']
+        }
+      ]
+    });
+
+    if (!project) {
+      return res.status(404).json({ message: 'Project not found' });
+    }
+
+    // Optional authentication — never fail the public preview on a bad token
+    let userId = null;
+    const token = req.headers.authorization?.split(' ')[1];
+    if (token) {
+      try {
+        userId = jwt.verify(token, process.env.JWT_SECRET).userId;
+      } catch (error) {
+        userId = null;
+      }
+    }
+
+    let unlocked = false;
+    if (userId) {
+      const completedOrder = await Order.findOne({
+        where: { userId, status: 'completed' },
+        include: [
+          {
+            model: OrderItem,
+            as: 'items',
+            where: { projectId: project.id, itemType: ['documentation', 'full'] },
+            required: true
+          }
+        ]
+      });
+      unlocked = Boolean(completedOrder);
+    }
+
+    const document = await ProjectDocument.findOne({ where: { projectId: project.id } });
+    const projectData = normalizeProject(project);
+
+    const payload = {
+      project: {
+        id: projectData.id,
+        title: projectData.title,
+        level: projectData.level,
+        institution: projectData.institution,
+        documentationPrice: projectData.documentationPrice,
+        documentationFile: projectData.documentationFile,
+        category: projectData.category
+      },
+      available: Boolean(document),
+      unlocked,
+      documentFiles: (projectData.documentFiles || []).filter((file) => fileExists(file.filePath))
+    };
+
+    if (!document) {
+      return res.json({
+        ...payload,
+        sample: null,
+        lockedSections: [],
+        teaser: project.summary || project.description || null,
+        message: 'No written preview is available for this project yet.'
+      });
+    }
+
+    if (unlocked) {
+      return res.json({
+        ...payload,
+        content: document.content,
+        totalLength: document.content.length
+      });
+    }
+
+    const { sample, sampleEnd } = buildSample(document.content);
+    const lockedSections = buildLockedSections(document.content, sampleEnd);
+
+    return res.json({
+      ...payload,
+      sample,
+      lockedSections,
+      totalLength: document.content.length
+    });
+  } catch (error) {
+    console.error('Get document preview error:', error);
+    res.status(500).json({ message: 'Server error building document preview' });
   }
 };
 

@@ -13,6 +13,7 @@
     "migrate:level-institution": "node src/config/migrateAddLevelInstitution.js",
     "migrate:project-documents": "node src/config/migrateAddProjectDocuments.js",
     "migrate:email-verification": "node src/config/migrateAddEmailVerification.js",
+    "migrate:profile-image": "node src/config/migrateAddProfileImage.js",
     "seed": "node src/config/seed.js",
     "generate-files": "node src/utils/generateMockFiles.js"
   },

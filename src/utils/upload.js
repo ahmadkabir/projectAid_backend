@@ -17,6 +17,8 @@ const storage = multer.diskStorage({
       folder += 'software/';
     } else if (file.fieldname === 'thumbnail') {
       folder += 'thumbnails/';
+    } else if (file.fieldname === 'avatar') {
+      folder += 'avatars/';
     }
     
     if (!fs.existsSync(folder)) {
@@ -39,7 +41,8 @@ const fileFilter = (req, file, cb) => {
     documentationFile: ['application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
     software: ['application/zip', 'application/x-zip-compressed', 'application/x-rar-compressed'],
     softwareFile: ['application/zip', 'application/x-zip-compressed', 'application/x-rar-compressed'],
-    thumbnail: ['image/jpeg', 'image/png', 'image/jpg', 'image/gif']
+    thumbnail: ['image/jpeg', 'image/png', 'image/jpg', 'image/gif'],
+    avatar: ['image/jpeg', 'image/png', 'image/jpg', 'image/gif', 'image/webp']
   };
 
   // Normalize fieldname for lookup

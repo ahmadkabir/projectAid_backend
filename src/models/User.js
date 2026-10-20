@@ -47,6 +47,11 @@ const User = sequelize.define('User', {
   verificationTokenExpires: {
     type: DataTypes.DATE,
     allowNull: true
+  },
+  // Filename inside uploads/avatars/ (not a full path)
+  profileImage: {
+    type: DataTypes.STRING,
+    allowNull: true
   }
 }, {
   tableName: 'users',

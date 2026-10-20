@@ -1,4 +1,6 @@
 import { validationResult } from 'express-validator';
+import fs from 'fs';
+import path from 'path';
 import { User, Order, SupportRequest } from '../models/index.js';
 
 // Profile of the authenticated user (never includes the password hash)
@@ -46,6 +48,39 @@ export const updateProfile = async (req, res) => {
   } catch (error) {
     console.error('Update profile error:', error);
     res.status(500).json({ message: 'Server error updating profile' });
+  }
+};
+
+export const uploadProfileImage = async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'Please upload an image file (JPEG, PNG, GIF or WebP)' });
+    }
+
+    const user = await User.findByPk(req.user.id);
+
+    // Remove the previous avatar (filename only — never trust a stored path)
+    if (user.profileImage) {
+      const oldPath = path.join('uploads', 'avatars', path.basename(user.profileImage));
+      fs.unlink(oldPath, (err) => {
+        if (err && err.code !== 'ENOENT') console.error('Failed to remove old avatar:', err.message);
+      });
+    }
+
+    user.profileImage = req.file.filename;
+    await user.save();
+
+    const updatedUser = await User.findByPk(user.id, {
+      attributes: { exclude: ['password'] }
+    });
+
+    res.json({
+      message: 'Profile image updated successfully',
+      user: updatedUser
+    });
+  } catch (error) {
+    console.error('Upload profile image error:', error);
+    res.status(500).json({ message: 'Server error uploading profile image' });
   }
 };
 

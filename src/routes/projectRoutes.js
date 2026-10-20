@@ -3,6 +3,7 @@ import { body, query } from 'express-validator';
 import {
   getAllProjects,
   getProjectById,
+  getDocumentPreview,
   createProject,
   updateProject,
   deleteProject,
@@ -17,7 +18,11 @@ const router = express.Router();
 // Public routes
 router.get('/', getAllProjects);
 router.get('/categories', getAllCategories);
-router.get('/:id', getProjectById);
+// Free sample of the documentation; unlocked for buyers (optional auth)
+router.get('/:id/document-preview', getDocumentPreview);
+
+// Authenticated routes
+router.get('/:id', authenticate, getProjectById);
 
 // Admin routes
 router.post(

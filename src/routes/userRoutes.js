@@ -7,9 +7,11 @@ import {
   deleteUser,
   getProfile,
   updateProfile,
+  uploadProfileImage,
   changePassword
 } from '../controllers/userController.js';
 import { authenticate, authorize } from '../middlewares/auth.js';
+import { upload } from '../utils/upload.js';
 
 const router = express.Router();
 
@@ -39,6 +41,8 @@ router.put(
   ],
   changePassword
 );
+
+router.put('/profile/avatar', authenticate, upload.single('avatar'), uploadProfileImage);
 
 router.get('/', authenticate, authorize('admin'), getAllUsers);
 router.get('/:id', authenticate, authorize('admin'), getUserById);
