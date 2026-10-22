@@ -3,6 +3,8 @@ import { body } from 'express-validator';
 import {
   createOrder,
   processPayment,
+  initializePayment,
+  verifyPayment,
   getUserOrders,
   getAllOrders,
   getOrderById
@@ -22,6 +24,10 @@ router.post(
   createOrder
 );
 
+router.post('/:id/pay', authenticate, initializePayment);
+
+// Mock payments are kept for automated tests only and are disabled unless
+// PAYMENTS_MOCK_ENABLED=true.
 router.post(
   '/:id/payment',
   authenticate,
@@ -34,6 +40,7 @@ router.post(
 
 router.get('/', authenticate, getUserOrders);
 router.get('/all', authenticate, authorize('admin'), getAllOrders);
+router.get('/payment-status', authenticate, verifyPayment);
 router.get('/:id', authenticate, getOrderById);
 
 export default router;

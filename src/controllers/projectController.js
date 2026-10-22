@@ -34,6 +34,7 @@ import {
 } from '../services/projectService.js';
 import { deleteObject, getStorageProvider } from '../services/storageService.js';
 import { extractProjectDocumentationText } from '../services/documentTextService.js';
+import { buildPdfFromText } from '../services/watermarkedPdfService.js';
 import { createUploadTicket, finalizeUpload } from '../services/directUploadService.js';
 
 const VALID_LEVELS = ['ND', 'HND', 'BSc', 'MSc'];
@@ -497,64 +498,84 @@ const buildLockedSections = (content, sampleEnd) => {
 };
 
 /**
+ * Shared resolver for the public preview (HTML metadata and PDF rendering).
+ * Returns `{ error }` for requests that must be rejected.
+ */
+const resolveDocumentPreview = async (req) => {
+  const project = await fetchProjectWithFiles(req.params.id);
+  if (!project) {
+    return { error: { status: 404, message: 'Project not found' } };
+  }
+
+  let userId = null;
+  const token = req.headers.authorization?.split(' ')[1];
+  if (token) {
+    try {
+      userId = jwt.verify(token, process.env.JWT_SECRET).userId;
+    } catch {
+      userId = null;
+    }
+  }
+
+  const user = userId ? await User.findByPk(userId) : null;
+  const isAdmin = user?.role === 'admin';
+
+  if (!isAdmin && normalizeStatus(project.status) !== 'published') {
+    return { error: { status: 404, message: 'Project not found' } };
+  }
+
+  // Admins see the customer-facing sample by default; they can request the
+  // full text explicitly with ?full=1 from the preview page toggle.
+  const wantsFull = String(req.query.full || '') === '1';
+  let unlocked = isAdmin && wantsFull;
+  if (userId && !unlocked) {
+    const completedOrder = await Order.findOne({
+      where: { userId, status: 'completed' },
+      include: [{
+        model: OrderItem,
+        as: 'items',
+        where: { projectId: project.id, itemType: ['documentation', 'full'] },
+        required: true
+      }]
+    });
+    unlocked = Boolean(completedOrder);
+  }
+
+  let document = await ProjectDocument.findOne({
+    where: { projectId: project.id }
+  });
+
+  // Uploaded documentation files (PDF/DOCX) have no stored text yet; extract
+  // it so visitors still get a restricted sample instead of an empty state.
+  if (!document) {
+    const extracted = await extractProjectDocumentationText(project);
+    if (extracted) document = { content: extracted.text };
+  }
+
+  return {
+    project,
+    user,
+    isAdmin,
+    unlocked,
+    wantsFull,
+    document,
+    projectData: serializeProject(project)
+  };
+};
+
+/**
  * Public document preview. Visitors get a server-redacted sample plus the list
  * of locked sections; buyers with a completed documentation order get the full
  * text.
  */
 export const getDocumentPreview = async (req, res) => {
   try {
-    const project = await fetchProjectWithFiles(req.params.id);
-
-    if (!project) {
-      return res.status(404).json({ message: 'Project not found' });
+    const resolved = await resolveDocumentPreview(req);
+    if (resolved.error) {
+      return res.status(resolved.error.status).json({ message: resolved.error.message });
     }
 
-    let userId = null;
-    const token = req.headers.authorization?.split(' ')[1];
-    if (token) {
-      try {
-        userId = jwt.verify(token, process.env.JWT_SECRET).userId;
-      } catch {
-        userId = null;
-      }
-    }
-
-    const user = userId ? await User.findByPk(userId) : null;
-    const isAdmin = user?.role === 'admin';
-
-    if (!isAdmin && normalizeStatus(project.status) !== 'published') {
-      return res.status(404).json({ message: 'Project not found' });
-    }
-
-    // Admins see the customer-facing sample by default; they can request the
-    // full text explicitly with ?full=1 from the preview page toggle.
-    const wantsFull = String(req.query.full || '') === '1';
-    let unlocked = isAdmin && wantsFull;
-    if (userId && !unlocked) {
-      const completedOrder = await Order.findOne({
-        where: { userId, status: 'completed' },
-        include: [{
-          model: OrderItem,
-          as: 'items',
-          where: { projectId: project.id, itemType: ['documentation', 'full'] },
-          required: true
-        }]
-      });
-      unlocked = Boolean(completedOrder);
-    }
-
-    let document = await ProjectDocument.findOne({
-      where: { projectId: project.id }
-    });
-
-    // Uploaded documentation files (PDF/DOCX) have no stored text yet; extract
-    // it so visitors still get a restricted sample instead of an empty state.
-    if (!document) {
-      const extracted = await extractProjectDocumentationText(project);
-      if (extracted) document = { content: extracted.text };
-    }
-
-    const projectData = serializeProject(project);
+    const { project, unlocked, document, projectData } = resolved;
 
     const payload = {
       project: {
@@ -609,6 +630,77 @@ export const getDocumentPreview = async (req, res) => {
   } catch (error) {
     console.error('Get document preview error:', error);
     res.status(500).json({ message: 'Server error building document preview' });
+  }
+};
+
+const previewPdfFileName = (project, unlocked) => {
+  const base = String(project.title || 'project')
+    .replace(/[^\w\s-]+/g, '')
+    .trim()
+    .replace(/\s+/g, '-')
+    .slice(0, 60);
+  return `${base || 'project'}-${unlocked ? 'document' : 'sample'}.pdf`;
+};
+
+/**
+ * The preview as a real PDF. Every page carries the ProjectAid watermark and a
+ * "Page X of Y" footer. Visitors receive only the free sample; buyers/admins
+ * (with ?full=1) receive the full document.
+ */
+export const getDocumentPreviewPdf = async (req, res) => {
+  try {
+    const resolved = await resolveDocumentPreview(req);
+    if (resolved.error) {
+      return res.status(resolved.error.status).json({ message: resolved.error.message });
+    }
+
+    const { project, user, unlocked, document } = resolved;
+
+    if (!document?.content || !String(document.content).trim()) {
+      return res.status(404).json({
+        message: 'No written preview is available for this project yet.'
+      });
+    }
+
+    const text = unlocked ? document.content : buildSample(document.content).sample;
+    const licensedTo = [user?.name, user?.email].filter(Boolean).join(' | ');
+    const stampDate = new Date().toLocaleDateString('en-GB', {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric'
+    });
+
+    const watermark = unlocked
+      ? `ProjectAid | Licensed to ${licensedTo || 'customer'}`
+      : 'ProjectAid | FREE SAMPLE - Purchase to unlock the full document';
+    const footer = unlocked
+      ? `ProjectAid - Licensed to ${licensedTo || 'customer'} - ${stampDate}`
+      : `ProjectAid - Free watermarked sample - ${stampDate}`;
+
+    const pdf = await buildPdfFromText({
+      title: project.title,
+      text,
+      watermark,
+      footer
+    });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${previewPdfFileName(project, unlocked)}"`
+    );
+    res.setHeader('Content-Length', String(pdf.length));
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+
+    return res.send(pdf);
+  } catch (error) {
+    console.error('Get document preview PDF error:', error);
+    if (!res.headersSent) {
+      return res.status(500).json({ message: 'Server error building document preview' });
+    }
+    return undefined;
   }
 };
 

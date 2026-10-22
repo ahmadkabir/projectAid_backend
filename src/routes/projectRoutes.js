@@ -4,6 +4,7 @@ import {
   getAllProjects,
   getProjectById,
   getDocumentPreview,
+  getDocumentPreviewPdf,
   createProject,
   updateProject,
   updateProjectStatus,
@@ -61,6 +62,8 @@ const softwareFields = projectFileUpload.fields([
 router.get('/', optionalAuthenticate, getAllProjects);
 router.get('/categories', getAllCategories);
 router.get('/:id/document-preview', getDocumentPreview);
+// Same content rendered as a watermarked PDF (page numbers in the footer).
+router.get('/:id/document-preview.pdf', getDocumentPreviewPdf);
 
 // Public route: the project page is viewable by visitors, but the controller
 // only reveals published projects to non-admins (everything else 404s).

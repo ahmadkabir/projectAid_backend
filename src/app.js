@@ -14,6 +14,7 @@ import userRoutes from './routes/userRoutes.js';
 import analyticsRoutes from './routes/analyticsRoutes.js';
 import documentRoutes from './routes/documentRoutes.js';
 import fileRoutes from './routes/fileRoutes.js';
+import { paystackWebhook } from './controllers/orderController.js';
 
 dotenv.config();
 
@@ -57,6 +58,14 @@ app.use(cors({
   },
   credentials: true
 }));
+
+// Paystack signs the raw webhook body, so this route must be mounted before
+// the JSON parser. It verifies the HMAC before trusting the event.
+app.post(
+  '/api/payments/paystack/webhook',
+  express.raw({ type: 'application/json', limit: '1mb' }),
+  paystackWebhook
+);
 
 // Body parsing middleware
 app.use(express.json());

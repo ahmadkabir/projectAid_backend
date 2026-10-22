@@ -3,3 +3,6 @@
 // is imported before any module that loads the environment.
 process.env.STORAGE_PROVIDER = 'local';
 process.env.UPLOAD_DIR = process.env.UPLOAD_DIR || 'uploads';
+// Integration tests use the mock payment endpoint; real deployments leave this
+// unset/false so only verified Paystack payments can complete an order.
+process.env.PAYMENTS_MOCK_ENABLED = 'true';

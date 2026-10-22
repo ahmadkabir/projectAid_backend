@@ -618,9 +618,165 @@ test('11. existing accounts, login and order history still work', async (t) => {
   assert.equal(dashboard.status, 200);
 });
 
+test('12. paystack initialize, verify and signed webhook complete an order once', async (t) => {
+  if (skipWithoutDb(t)) return;
+
+  const originalKey = process.env.PAYSTACK_SECRET_KEY;
+  const originalCurrency = process.env.PAYSTACK_CURRENCY;
+  const realFetch = globalThis.fetch;
+  const secret = 'sk_test_integration_secret';
+  process.env.PAYSTACK_SECRET_KEY = secret;
+  process.env.PAYSTACK_CURRENCY = 'NGN';
+
+  const fakePaystackResponse = (data) => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ status: true, data })
+  });
+
+  let reference = '';
+
+  globalThis.fetch = async (url, options) => {
+    const target = String(url);
+
+    if (target.includes('/transaction/initialize')) {
+      const body = JSON.parse(options.body);
+      reference = body.reference;
+      return fakePaystackResponse({
+        authorization_url: 'https://checkout.paystack.com/integration-test',
+        access_code: 'integration-access-code',
+        reference
+      });
+    }
+
+    if (target.includes('/transaction/verify/')) {
+      return fakePaystackResponse({
+        status: 'success',
+        reference,
+        amount: orderAmountKobo,
+        currency: 'NGN',
+        metadata: { orderId: String(order.id), userId: String(student.id) }
+      });
+    }
+
+    return realFetch(url, options);
+  };
+
+  let order;
+  let orderAmountKobo;
+
+  try {
+    const project = await createProject(
+      baseFields(`Paystack Resource ${Date.now()}`, { status: 'published' }),
+      {
+        documentationFile: {
+          name: 'paystack-docs.pdf',
+          mime: 'application/pdf',
+          buffer: pdf('paystack resource')
+        }
+      }
+    );
+
+    const created = await request('/api/orders', {
+      method: 'POST',
+      who: 'student',
+      body: { items: [{ projectId: project.id, itemType: 'documentation' }] }
+    });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    order = created.body.order;
+    orderAmountKobo = Math.round(Number(order.totalAmount) * 100);
+
+    const initialized = await request(`/api/orders/${order.id}/pay`, {
+      method: 'POST',
+      who: 'student'
+    });
+    assert.equal(initialized.status, 200, JSON.stringify(initialized.body));
+    assert.equal(initialized.body.authorizationUrl, 'https://checkout.paystack.com/integration-test');
+    assert.equal(initialized.body.reference, reference);
+
+    const verified = await request(
+      `/api/orders/payment-status?reference=${encodeURIComponent(reference)}`,
+      { who: 'student' }
+    );
+    assert.equal(verified.status, 200, JSON.stringify(verified.body));
+    assert.equal(verified.body.paymentStatus, 'success');
+    assert.equal(verified.body.order.status, 'completed');
+    assert.equal(verified.body.order.paymentMethod, 'paystack');
+
+    // A second order is completed by a signed charge.success webhook.
+    const webhookProject = await createProject(
+      baseFields(`Webhook Resource ${Date.now()}`, { status: 'published' }),
+      {
+        documentationFile: {
+          name: 'webhook-docs.pdf',
+          mime: 'application/pdf',
+          buffer: pdf('webhook resource')
+        }
+      }
+    );
+
+    const webhookOrderResponse = await request('/api/orders', {
+      method: 'POST',
+      who: 'student',
+      body: { items: [{ projectId: webhookProject.id, itemType: 'documentation' }] }
+    });
+    assert.equal(webhookOrderResponse.status, 201);
+    const webhookOrder = webhookOrderResponse.body.order;
+    const webhookReference = `PA-WEBHOOK-${Date.now()}`;
+    const rawBody = JSON.stringify({
+      event: 'charge.success',
+      data: {
+        reference: webhookReference,
+        status: 'success',
+        amount: Math.round(Number(webhookOrder.totalAmount) * 100),
+        currency: 'NGN',
+        metadata: { orderId: String(webhookOrder.id), userId: String(student.id) }
+      }
+    });
+    const signature = crypto
+      .createHmac('sha512', secret)
+      .update(rawBody)
+      .digest('hex');
+
+    const invalid = await realFetch(`${baseUrl}/api/payments/paystack/webhook`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-paystack-signature': 'bad-signature' },
+      body: rawBody
+    });
+    assert.equal(invalid.status, 401);
+
+    const webhook = await realFetch(`${baseUrl}/api/payments/paystack/webhook`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-paystack-signature': signature },
+      body: rawBody
+    });
+    assert.equal(webhook.status, 200);
+
+    const paidWebhookOrder = await Order.findByPk(webhookOrder.id);
+    assert.equal(paidWebhookOrder.status, 'completed');
+    assert.equal(paidWebhookOrder.paymentMethod, 'paystack');
+    assert.equal(paidWebhookOrder.transactionId, webhookReference);
+
+    const duplicate = await realFetch(`${baseUrl}/api/payments/paystack/webhook`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-paystack-signature': signature },
+      body: rawBody
+    });
+    assert.equal(duplicate.status, 200);
+    const duplicatePayload = await duplicate.json();
+    assert.equal(duplicatePayload.alreadyProcessed, true);
+  } finally {
+    globalThis.fetch = realFetch;
+    if (originalKey === undefined) delete process.env.PAYSTACK_SECRET_KEY;
+    else process.env.PAYSTACK_SECRET_KEY = originalKey;
+    if (originalCurrency === undefined) delete process.env.PAYSTACK_CURRENCY;
+    else process.env.PAYSTACK_CURRENCY = originalCurrency;
+  }
+});
+
 // Cleanup runs as the final test so the HTTP server and database are closed
 // deterministically even if an earlier assertion failed.
-test('12. clean up test data', async (t) => {
+test('13. clean up test data', async (t) => {
   if (skipWithoutDb(t)) return;
 
   // Tests 7/8 order real seeded projects with test students, so items must be

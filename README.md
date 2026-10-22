@@ -36,6 +36,28 @@ Set `STORAGE_PROVIDER=s3` plus either the `STORAGE_S3_*` or `R2_*` variables
 - After switching to R2, run `npm run migrate:files-to-r2` to copy existing
   local files and verify each copy before updating its database row.
 
+## Payments (Paystack)
+
+Set `PAYSTACK_SECRET_KEY`, `PAYSTACK_CURRENCY=NGN` and
+`PAYSTACK_CALLBACK_URL` in `.env`. The browser is redirected to Paystack's
+hosted checkout; the API verifies the transaction before completing an order.
+
+- `POST /api/orders/:id/pay` - initialize a transaction for a pending order.
+- `GET /api/orders/payment-status?reference=...` - verify after checkout.
+- `POST /api/payments/paystack/webhook` - signed Paystack webhook.
+- `POST /api/orders/:id/payment` - mock flow, disabled unless
+  `PAYMENTS_MOCK_ENABLED=true` (tests only).
+
+Add the webhook URL in the Paystack dashboard:
+
+```
+https://<your-public-api-host>/api/payments/paystack/webhook
+```
+
+For local testing use a tunnel such as `ngrok http 5001` and register the
+resulting HTTPS URL; Paystack cannot reach `localhost`. The webhook route keeps
+the raw request body because Paystack signs it with HMAC-SHA512.
+
 ## API Documentation
 
 See main README.md for complete API endpoint documentation.
