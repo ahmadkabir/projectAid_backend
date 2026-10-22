@@ -30,19 +30,23 @@ const Project = sequelize.define('Project', {
   },
   softwarePrice: {
     type: DataTypes.DECIMAL(10, 2),
-    defaultValue: 0.00
+    defaultValue: 0.00,
+    comment: 'Price of the software when it is sold separately (0 when included)'
   },
   fullProjectPrice: {
     type: DataTypes.DECIMAL(10, 2),
-    defaultValue: 0.00
+    defaultValue: 0.00,
+    comment: 'Optional bundled price for documentation + separately sold software'
   },
   documentationFile: {
     type: DataTypes.STRING,
-    allowNull: true
+    allowNull: true,
+    comment: 'Legacy: file name of the current documentation file. Metadata lives in project_document_files'
   },
   softwareFile: {
     type: DataTypes.STRING,
-    allowNull: true
+    allowNull: true,
+    comment: 'Legacy: file name of the current software installer. Metadata lives in project_document_files'
   },
   thumbnail: {
     type: DataTypes.STRING,
@@ -64,18 +68,20 @@ const Project = sequelize.define('Project', {
     comment: 'Key features and deliverables (JSON or text)'
   },
   status: {
-    type: DataTypes.ENUM('active', 'inactive'),
-    defaultValue: 'active'
+    type: DataTypes.ENUM('draft', 'pending_review', 'published', 'archived'),
+    defaultValue: 'draft',
+    allowNull: false,
+    comment: 'Lifecycle state: draft, pending_review, published or archived'
   },
   projectType: {
     type: DataTypes.ENUM('documentation', 'software'),
     allowNull: true,
-    comment: 'Project type: documentation or software'
+    comment: 'documentation = documentation only, software = documentation plus accompanying software'
   },
   price: {
     type: DataTypes.DECIMAL(10, 2),
     allowNull: true,
-    comment: 'Single price field (replaces documentationPrice/softwarePrice/fullProjectPrice)'
+    comment: 'Documentation price (mirrors documentationPrice)'
   },
   level: {
     type: DataTypes.ENUM('ND', 'HND', 'BSc', 'MSc'),
@@ -86,6 +92,49 @@ const Project = sequelize.define('Project', {
     type: DataTypes.STRING(255),
     allowNull: true,
     comment: 'Institution name (e.g., Federal Polytechnic, Kano)'
+  },
+  // --- Accompanying software ------------------------------------------------
+  softwareName: {
+    type: DataTypes.STRING(255),
+    allowNull: true
+  },
+  softwareVersion: {
+    type: DataTypes.STRING(64),
+    allowNull: true
+  },
+  softwareDescription: {
+    type: DataTypes.TEXT,
+    allowNull: true
+  },
+  softwareOperatingSystem: {
+    type: DataTypes.TEXT,
+    allowNull: true,
+    comment: 'Supported operating system(s)'
+  },
+  softwareRequirements: {
+    type: DataTypes.TEXT,
+    allowNull: true,
+    comment: 'System requirements'
+  },
+  softwareLicense: {
+    type: DataTypes.TEXT,
+    allowNull: true,
+    comment: 'Licence terms for the software'
+  },
+  softwareRedistributionAllowed: {
+    type: DataTypes.BOOLEAN,
+    allowNull: true,
+    comment: 'Whether the supplier permits the buyer to redistribute the software'
+  },
+  softwareSaleMode: {
+    type: DataTypes.ENUM('included', 'separate'),
+    allowNull: true,
+    comment: 'included = software comes with the documentation purchase, separate = sold on its own'
+  },
+  softwareStatus: {
+    type: DataTypes.ENUM('active', 'archived'),
+    allowNull: true,
+    comment: 'null = no software, active = available, archived = removed from sale'
   }
 }, {
   tableName: 'projects',

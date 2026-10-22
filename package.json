@@ -2,11 +2,13 @@
   "name": "projectaid-backend",
   "version": "1.0.0",
   "description": "Backend API for ProjectAid MVP",
-  "main": "src/app.js",
+  "main": "src/server.js",
   "type": "module",
   "scripts": {
-    "start": "node src/app.js",
-    "dev": "nodemon src/app.js",
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "test": "node --test test/",
+    "test:integration": "node --test --test-concurrency=1 test/",
     "migrate": "node src/config/migrate.js",
     "migrate:category": "node src/config/migrateAddCategory.js",
     "migrate:set-documentation": "node src/config/migrateSetAllDocumentation.js",
@@ -14,6 +16,8 @@
     "migrate:project-documents": "node src/config/migrateAddProjectDocuments.js",
     "migrate:email-verification": "node src/config/migrateAddEmailVerification.js",
     "migrate:profile-image": "node src/config/migrateAddProfileImage.js",
+    "migrate:docs-software": "node src/config/migrateDocumentationAndSoftware.js",
+    "migrate:files-to-r2": "node src/config/migrateLocalFilesToR2.js",
     "seed": "node src/config/seed.js",
     "generate-files": "node src/utils/generateMockFiles.js"
   },
@@ -21,6 +25,8 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1155.0",
+    "@aws-sdk/s3-request-presigner": "^3.1155.0",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
@@ -31,10 +37,13 @@
     "html-docx-js": "^0.3.1",
     "html-pdf": "^3.0.1",
     "jsonwebtoken": "^9.0.2",
+    "mammoth": "^1.8.0",
     "multer": "^1.4.5-lts.1",
     "mysql2": "^3.6.5",
     "nodemailer": "^10.1.7",
     "openai": "^6.16.0",
+    "pdf-lib": "^1.17.1",
+    "pdf-parse": "^1.1.1",
     "sequelize": "^6.35.2"
   },
   "devDependencies": {

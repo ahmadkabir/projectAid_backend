@@ -1,14 +1,9 @@
-import { fileURLToPath } from 'url';
-import path from 'path';
-import fs from 'fs';
 import pdf from 'html-pdf';
 import htmlDocx from 'html-docx-js';
-import { Project, ProjectCategory, ProjectDocument, ProjectDocumentFile } from '../models/index.js';
+import sequelize from '../config/database.js';
+import { Project, ProjectCategory, ProjectDocument } from '../models/index.js';
 import { generateFreeDocument } from '../utils/freeAIGenerator.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const uploadsRoot = path.resolve(__dirname, '../../uploads');
+import { storeProjectFile } from '../services/projectFileService.js';
 
 // Initialize OpenAI client (handle case where package might not be installed)
 let OpenAI = null;
@@ -369,14 +364,6 @@ export const saveDocument = async (req, res) => {
   }
 };
 
-const ensureDocumentsDir = (projectId) => {
-  const projectDir = path.join(uploadsRoot, 'projects', `${projectId}`, 'documents');
-  if (!fs.existsSync(projectDir)) {
-    fs.mkdirSync(projectDir, { recursive: true });
-  }
-  return projectDir;
-};
-
 const formatHtmlForExport = (project, rawContent) => {
   const projectTitle = project?.title || 'ProjectAid Document';
   const styles = `
@@ -464,28 +451,47 @@ export const saveDocumentFile = async (req, res) => {
       buffer = await htmlToPdfBuffer(formattedHtml);
     }
 
-    const directory = ensureDocumentsDir(project.id);
     const fileName = generateDocumentFileName(project.title, format);
-    const filePath = path.join(directory, fileName);
+    const mimeType = format === 'pdf'
+      ? 'application/pdf'
+      : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 
-    fs.writeFileSync(filePath, buffer);
+    // Export through the same private storage path as any other documentation:
+    // metadata in MySQL, bytes in object storage, old exports kept as history.
+    const { documentFile, project: savedProject } = await sequelize.transaction(async (transaction) => {
+      const record = await storeProjectFile({
+        projectId: project.id,
+        category: 'documentation',
+        createdBy: req.user?.id || null,
+        transaction,
+        file: {
+          buffer,
+          originalname: fileName,
+          mimetype: mimeType,
+          size: buffer.length
+        }
+      });
 
-    const relativePath = path.relative(path.resolve(__dirname, '../../'), filePath).replace(/\\/g, '/');
+      project.documentationFile = record.fileName;
+      await project.save({ transaction });
 
-    const documentFile = await ProjectDocumentFile.create({
-      projectId: project.id,
-      fileName,
-      fileType: format,
-      filePath: relativePath,
-      createdBy: req.user?.id || null
+      return { documentFile: record, project };
     });
 
     res.json({
       status: 'success',
       message: 'Document generated and saved successfully',
-      fileName,
+      fileName: documentFile.fileName,
       projectId: project.id,
-      documentFile
+      documentationFile: savedProject.documentationFile,
+      documentFile: {
+        id: documentFile.id,
+        fileName: documentFile.fileName,
+        fileType: documentFile.fileType,
+        category: documentFile.category,
+        fileSize: documentFile.fileSize,
+        downloadUrl: `/api/files/${documentFile.id}/download`
+      }
     });
   } catch (error) {
     console.error('Save document file error:', error);

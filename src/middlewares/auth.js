@@ -23,6 +23,28 @@ export const authenticate = async (req, res, next) => {
   }
 };
 
+/**
+ * Attach req.user when a valid token is present, but never reject the request.
+ * Used by endpoints that are public yet show more data to administrators (for
+ * example the catalogue, which hides unpublished projects from visitors).
+ */
+export const optionalAuthenticate = async (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) {
+    req.user = null;
+    return next();
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = await User.findByPk(decoded.userId);
+  } catch {
+    req.user = null;
+  }
+
+  return next();
+};
+
 export const authorize = (...roles) => {
   return (req, res, next) => {
     if (!req.user) {

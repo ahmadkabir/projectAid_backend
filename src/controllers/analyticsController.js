@@ -29,7 +29,7 @@ export const getDashboard = async (req, res) => {
 
     // Total counts
     const totalUsers = await User.count();
-    const totalProjects = await Project.count({ where: { status: 'active' } });
+    const totalProjects = await Project.count({ where: { status: 'published' } });
     const totalOrders = await Order.count();
     
     // Revenue
@@ -106,12 +106,20 @@ export const getDashboard = async (req, res) => {
       });
     }
 
-    // Top projects by purchases
+    // Top projects by purchases. An item only counts when its order still
+    // exists and was actually completed — orphaned or unpaid items must not
+    // inflate the metric.
     const orderItems = await OrderItem.findAll({
       include: [{
         model: Project,
         as: 'project',
         attributes: ['id', 'title']
+      }, {
+        model: Order,
+        as: 'order',
+        attributes: ['id'],
+        required: true,
+        where: { status: 'completed' }
       }]
     });
 
@@ -222,7 +230,15 @@ export const getProjects = async (req, res) => {
     const projects = await Project.findAll({
       include: [{
         model: OrderItem,
-        as: 'orderItems'
+        as: 'orderItems',
+        required: false,
+        include: [{
+          model: Order,
+          as: 'order',
+          attributes: ['id'],
+          required: true,
+          where: { status: 'completed' }
+        }]
       }]
     });
 

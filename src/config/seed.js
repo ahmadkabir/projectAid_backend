@@ -1,5 +1,5 @@
 import sequelize from './database.js';
-import { User, ProjectCategory, Project } from '../models/index.js';
+import { User, ProjectCategory, Project, ProjectDocumentFile } from '../models/index.js';
 import bcrypt from 'bcryptjs';
 import { courses, courseBasedProjects, generateFileName } from './courseBasedProjects.js';
 
@@ -107,18 +107,45 @@ async function seed() {
         : null;
       const thumbnail = generateFileName(mockProject.title, 'thumbnail');
 
+      const hasSoftware = Boolean(softwareFile) || mockProject.softwarePrice > 0 || mockProject.fullProjectPrice > 0;
+      const saleMode = hasSoftware ? (mockProject.softwarePrice > 0 ? 'separate' : 'included') : null;
+
       const project = await Project.create({
         title: mockProject.title,
         description: mockProject.description,
         categoryId: category.id,
         documentationPrice: mockProject.documentationPrice,
-        softwarePrice: mockProject.softwarePrice,
-        fullProjectPrice: mockProject.fullProjectPrice,
+        softwarePrice: hasSoftware && saleMode === 'separate' ? mockProject.softwarePrice : 0,
+        fullProjectPrice: hasSoftware && saleMode === 'separate' ? mockProject.fullProjectPrice : 0,
+        price: mockProject.documentationPrice,
         documentationFile: docFile,
         softwareFile: softwareFile,
         thumbnail: thumbnail,
-        status: 'active'
+        status: 'published',
+        projectType: hasSoftware ? 'software' : 'documentation',
+        softwareStatus: hasSoftware ? 'active' : null,
+        softwareName: hasSoftware ? `${mockProject.title} Software` : null,
+        softwareSaleMode: saleMode
       });
+
+      // File metadata rows so seeded files are downloadable through the API.
+      for (const [category, fileName] of [['documentation', docFile], ['software', softwareFile]]) {
+        if (!fileName) continue;
+        const extension = fileName.split('.').pop().toLowerCase();
+        await ProjectDocumentFile.create({
+          projectId: project.id,
+          fileName,
+          originalName: fileName,
+          category,
+          fileType: ['pdf', 'doc', 'docx', 'zip', 'rar'].includes(extension) ? extension : 'zip',
+          filePath: `uploads/${category}/${fileName}`,
+          storageKey: `${category}/${fileName}`,
+          storageProvider: 'local',
+          mimeType: category === 'software' ? 'application/zip' : 'application/pdf',
+          uploadStatus: 'completed',
+          isCurrent: true
+        });
+      }
 
       console.log(`✓ Created project: ${project.title} (${mockProject.courseName})`);
       createdCount++;

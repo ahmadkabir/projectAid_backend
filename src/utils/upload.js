@@ -64,3 +64,24 @@ export const upload = multer({
   },
   fileFilter: fileFilter
 });
+
+/**
+ * Project file uploads are held in memory so they can be validated (extension,
+ * declared type and magic bytes) before anything is written to object storage.
+ * The per-purpose size limits are enforced again in fileValidation.js.
+ */
+const maxProjectFileSize = Math.max(
+  parseInt(process.env.MAX_SOFTWARE_FILE_SIZE, 10) || 0,
+  parseInt(process.env.MAX_DOCUMENTATION_FILE_SIZE, 10) || 0,
+  parseInt(process.env.MAX_FILE_SIZE, 10) || 0,
+  52428800
+);
+
+export const projectFileUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: maxProjectFileSize,
+    files: 8,
+    fields: 40
+  }
+});
