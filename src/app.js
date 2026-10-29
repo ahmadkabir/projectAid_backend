@@ -13,7 +13,7 @@ import analyticsRoutes from './routes/analyticsRoutes.js';
 import documentRoutes from './routes/documentRoutes.js';
 import fileRoutes from './routes/fileRoutes.js';
 import { paystackWebhook } from './controllers/orderController.js';
-import { connectDatabase } from './config/mongo.js';
+import { connectDatabase, hintForMongoError } from './config/mongo.js';
 import { servePublicAsset } from './utils/publicAssets.js';
 
 const app = express();
@@ -73,6 +73,25 @@ app.get('/health', (req, res) => {
  */
 let databasePromise = null;
 
+/**
+ * A short, non-sensitive code that tells the caller (and us) which class of
+ * database failure happened. Never include the connection string or password.
+ */
+const databaseErrorCode = (error) => {
+  const message = String(error?.message || '');
+
+  if (/not configured in your environment/i.test(message)) return 'MISSING_ENV';
+  if (/Invalid DATABASE_MODE/i.test(message)) return 'INVALID_DATABASE_MODE';
+  if (/does not start with mongodb/i.test(message)) return 'INVALID_MONGODB_URI';
+  if (/bad auth|authentication failed/i.test(message)) return 'AUTH_FAILED';
+  if (/enotfound|querysrv/i.test(message)) return 'DNS_LOOKUP_FAILED';
+  if (/econnrefused/i.test(message)) return 'CONNECTION_REFUSED';
+  if (/server selection|etimedout/i.test(message)) return 'CONNECTION_TIMEOUT';
+  if (/ssl|tls|certificate/i.test(message)) return 'TLS_FAILED';
+
+  return error?.code || error?.cause?.code || error?.name || 'UNKNOWN';
+};
+
 const ensureDatabase = async (req, res, next) => {
   try {
     if (!databasePromise) {
@@ -87,7 +106,13 @@ const ensureDatabase = async (req, res, next) => {
     return next();
   } catch (error) {
     console.error('Database connection failed:', error.message);
-    return res.status(503).json({ message: 'Database is temporarily unavailable' });
+
+    const hint = hintForMongoError(error?.message || '');
+    return res.status(503).json({
+      message: 'Database is temporarily unavailable',
+      code: databaseErrorCode(error),
+      ...(hint ? { hint } : {})
+    });
   }
 };
 
