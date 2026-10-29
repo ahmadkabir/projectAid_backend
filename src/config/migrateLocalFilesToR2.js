@@ -1,7 +1,6 @@
-import 'dotenv/config';
+import '../config/env.js';
 import fsp from 'fs/promises';
-import sequelize from './database.js';
-import '../models/index.js';
+import { connectDatabase, disconnectDatabase } from './mongo.js';
 import ProjectDocumentFile from '../models/ProjectDocumentFile.js';
 import {
   getStorageProvider,
@@ -60,21 +59,19 @@ async function main() {
   }
   if (DRY_RUN) log('DRY RUN — no objects or rows will be modified.');
 
-  await sequelize.authenticate();
+  await connectDatabase();
   log('Database connected.');
 
-  const options = {
-    order: [['id', 'ASC']]
-  };
-  if (LIMIT) options.limit = LIMIT;
+  const query = ProjectDocumentFile.find().sort({ createdAt: 1 });
+  if (LIMIT) query.limit(LIMIT);
 
-  const files = await ProjectDocumentFile.findAll(options);
+  const files = await query.exec();
   log(`Found ${files.length} file record(s).\n`);
 
   const summary = { migrated: 0, alreadyMigrated: 0, missingLocal: 0, skipped: 0, failed: 0 };
 
   for (const file of files) {
-    const label = `#${file.id} ${file.category} ${file.originalName || file.fileName}`;
+    const label = `#${file.legacyId || file._id} ${file.category} ${file.originalName || file.fileName}`;
 
     if (file.storageProvider === 's3' && file.storageKey) {
       const head = await statObject(file.storageKey).catch(() => null);
@@ -122,13 +119,12 @@ async function main() {
         }
       }
 
-      await file.update({
-        storageKey: key,
-        storageProvider: 's3',
-        filePath: file.filePath || `uploads/${key}`,
-        fileSize: buffer.length,
-        checksum: checksumOf(buffer)
-      });
+      file.storageKey = key;
+      file.storageProvider = 's3';
+      file.filePath = file.filePath || `uploads/${key}`;
+      file.fileSize = buffer.length;
+      file.checksum = checksumOf(buffer);
+      await file.save();
 
       summary.migrated += 1;
       log(`ok     ${label} — ${buffer.length} bytes${VERIFY ? ' (verified)' : ''}`);
@@ -155,5 +151,5 @@ main()
     process.exitCode = 1;
   })
   .finally(async () => {
-    await sequelize.close().catch(() => {});
+    await disconnectDatabase().catch(() => {});
   });

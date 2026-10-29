@@ -1,39 +1,8 @@
-import { DataTypes } from 'sequelize';
-import sequelize from '../config/database.js';
+import mongoose from 'mongoose';
+import { orderItemSchema } from './Order.js';
 
-const OrderItem = sequelize.define('OrderItem', {
-  id: {
-    type: DataTypes.INTEGER,
-    primaryKey: true,
-    autoIncrement: true
-  },
-  orderId: {
-    type: DataTypes.INTEGER,
-    allowNull: false,
-    references: {
-      model: 'orders',
-      key: 'id'
-    }
-  },
-  projectId: {
-    type: DataTypes.INTEGER,
-    allowNull: false,
-    references: {
-      model: 'projects',
-      key: 'id'
-    }
-  },
-  itemType: {
-    type: DataTypes.ENUM('documentation', 'software', 'full'),
-    allowNull: false
-  },
-  price: {
-    type: DataTypes.DECIMAL(10, 2),
-    allowNull: false
-  }
-}, {
-  tableName: 'order_items',
-  timestamps: true
-});
+// OrderItem is embedded inside Order in MongoDB.
+// This standalone model is provided for backwards compatibility if needed.
+const OrderItem = mongoose.models.OrderItem || mongoose.model('OrderItem', orderItemSchema);
 
 export default OrderItem;

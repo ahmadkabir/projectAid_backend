@@ -76,15 +76,23 @@ export const getPurchaseOptions = (project, { hasDocumentationFile = true, hasIn
   const mode = saleModeOf(project);
 
   if (hasDocumentationFile && docPrice > 0) {
+    // The software can be declared before its installer is ready. Until the
+    // installer exists it is not advertised as part of the documentation sale.
+    const softwareIncluded = mode === 'included' && hasInstaller;
+    const softwarePending = mode === 'included' && !hasInstaller;
+
     options.push({
       type: 'documentation',
-      label: mode === 'included' ? 'Documentation + Software' : 'Project Documentation',
+      label: softwareIncluded ? 'Documentation + Software' : 'Project Documentation',
       price: docPrice,
-      includesSoftware: mode === 'included',
+      includesSoftware: softwareIncluded,
+      softwarePending,
       description:
-        mode === 'included'
+        softwareIncluded
           ? 'Full documentation with the accompanying software included.'
-          : 'Complete documentation for this project.'
+          : softwarePending
+            ? 'Complete documentation. The accompanying software will be available once its installer is uploaded.'
+            : 'Complete documentation for this project.'
     });
   }
 
@@ -101,7 +109,7 @@ export const getPurchaseOptions = (project, { hasDocumentationFile = true, hasIn
     }
 
     const fullPrice = toNumber(project.fullProjectPrice);
-    if (fullPrice > 0) {
+    if (hasDocumentationFile && docPrice > 0 && fullPrice > 0) {
       options.push({
         type: 'full',
         label: 'Full Project (Documentation + Software)',
@@ -223,6 +231,10 @@ export const validateProjectForStatus = ({
     }
   }
 
+  if ((targetStatus === 'pending_review' || targetStatus === 'published') && legacySoftwareOnly && !hasInstaller) {
+    errors.push('Upload the software installer before submitting or publishing a software-only project');
+  }
+
   if (softwareEnabled) {
     if (!String(data.softwareName || '').trim()) {
       errors.push('Software name is required when the project has accompanying software');
@@ -234,7 +246,9 @@ export const validateProjectForStatus = ({
     }
 
     if (targetStatus === 'pending_review' || targetStatus === 'published') {
-      if (!hasInstaller) errors.push('Upload the software installer before submitting or publishing');
+      // The installer may be attached later, so the project can be reviewed or
+      // published while the software is still being prepared. It is only
+      // advertised as an add-on once the installer exists.
       if (mode === 'separate' && toNumber(data.softwarePrice) <= 0) {
         errors.push('Software price must be greater than 0 when it is sold separately');
       }

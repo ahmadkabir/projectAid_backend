@@ -15,10 +15,97 @@ Express.js backend API for ProjectAid MVP.
 
 - `npm start` - Start production server
 - `npm run dev` - Start development server with nodemon
+- `npm run db:check` - Verify the database connection, TLS cipher and tables
+- `npm run db:check-mongo` - Verify an optional MongoDB `MONGODB_URI` connection
 - `npm run migrate` - Run database migrations
 - `npm run seed` - Seed initial data
 - `npm run migrate:files-to-r2` - Copy existing local project files to R2
   (supports `--dry-run`, `--limit=50`, `--no-verify`; never deletes local files)
+
+## Database connection
+
+All application data is stored in MongoDB through Mongoose. Configure one of:
+
+```dotenv
+# Cloud MongoDB (Atlas, etc.)
+DATABASE_MODE=online
+MONGODB_URI=mongodb+srv://<user>:<password>@<cluster>/projectaid?retryWrites=true&w=majority
+
+# Or a local daemon
+DATABASE_MODE=local
+MONGODB_LOCAL_URI=mongodb://127.0.0.1:27017/projectaid
+```
+
+Optional: `MONGODB_DB` overrides the database in the URI,
+`MONGODB_CONNECT_TIMEOUT` (ms) and `MONGODB_POOL_MAX` (default 10; use a lower
+value such as 5 on serverless). Verify the connection with:
+
+```bash
+npm run db:check-mongo
+```
+
+It resolves DNS/SRV, authenticates, pings the server and lists collections in
+the target database, then exits 0. On failure it prints the driver error plus
+the likely fix (bad credentials, `authSource`, unreachable host, missing IP
+allowlist entry).
+
+The `DB_*` variables and `npm run db:check` / `npm run migrate` belong to the
+legacy MySQL migration scripts only; the running API never uses them.
+
+## Deploying to Vercel
+
+Vercel detects the Express app (`src/app.js` / `src/server.js`) and runs it as a
+single Function with Fluid compute. No `vercel.json` is required.
+
+1. **Root Directory**: set it to `projectAid_backend` in the Vercel project.
+2. **Node version**: `package.json` pins `22.x` (Mongoose 9 requires >= 20.19).
+3. **Environment variables** (Project Settings → Environment Variables):
+
+   ```dotenv
+   DATABASE_MODE=online
+   MONGODB_URI=...
+   JWT_SECRET=...
+   FRONTEND_URL=https://your-frontend.example.com
+
+   # Required on Vercel: the filesystem is read-only
+   STORAGE_PROVIDER=s3
+   R2_ENDPOINT=https://<account>.r2.cloudflarestorage.com
+   R2_BUCKET_NAME=...
+   R2_ACCESS_KEY_ID=...
+   R2_SECRET_ACCESS_KEY=...
+
+   PAYSTACK_SECRET_KEY=...
+   PAYSTACK_CALLBACK_URL=https://your-frontend.example.com/payment/callback
+   PAYMENTS_MOCK_ENABLED=false
+
+   EMAIL_PROVIDER=smtp
+   EMAIL_SMTP_HOST=...
+   EMAIL_SMTP_PORT=587
+   EMAIL_USER=...
+   EMAIL_PASS=...
+   EMAIL_FROM=...
+   ```
+
+4. Upload the existing public images once, because `uploads/` is not part of the
+   deployment and cannot be written to at runtime:
+
+   ```bash
+   npm run migrate:public-assets -- --dry-run
+   npm run migrate:public-assets
+   ```
+
+5. Add the webhook URL in Paystack:
+   `https://<your-api>/api/payments/paystack/webhook`.
+
+Notes:
+
+- Vercel caps request and buffered response bodies at 4.5 MB. Paid files use
+  presigned direct-to-R2 uploads, and generated PDFs are streamed, so they are
+  not affected. Keep avatars/thumbnails under 4 MB.
+- `express.static` is ignored on Vercel. Thumbnails and avatars are served by
+  the API from the configured storage provider instead.
+- The rate limiter is per instance. Use a shared store (e.g. Upstash Redis) if
+  you need a strict global limit.
 
 ## Object storage (Cloudflare R2)
 

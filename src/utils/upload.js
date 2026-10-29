@@ -1,55 +1,39 @@
 import multer from 'multer';
-import path from 'path';
-import fs from 'fs';
 
-// Ensure upload directory exists
-const uploadDir = 'uploads';
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
+/**
+ * Upload handling.
+ *
+ * Nothing is written to disk here: Vercel's deployment filesystem is read-only
+ * and only `/tmp` is writable. Project files are buffered and sent to the
+ * configured storage provider (local `uploads/` in development, R2/S3 in
+ * production); avatars use the same path.
+ */
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    let folder = 'uploads/';
-    if (file.fieldname === 'documentation' || file.fieldname === 'documentationFile') {
-      folder += 'documentation/';
-    } else if (file.fieldname === 'software' || file.fieldname === 'softwareFile') {
-      folder += 'software/';
-    } else if (file.fieldname === 'thumbnail') {
-      folder += 'thumbnails/';
-    } else if (file.fieldname === 'avatar') {
-      folder += 'avatars/';
-    }
-    
-    if (!fs.existsSync(folder)) {
-      fs.mkdirSync(folder, { recursive: true });
-    }
-    cb(null, folder);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    // Normalize fieldname for consistent file naming
-    const normalizedName = file.fieldname === 'documentationFile' ? 'documentation' : 
-                          file.fieldname === 'softwareFile' ? 'software' : file.fieldname;
-    cb(null, normalizedName + '-' + uniqueSuffix + path.extname(file.originalname));
-  }
-});
+const allowedMimes = {
+  documentation: [
+    'application/pdf',
+    'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+  ],
+  documentationFile: [
+    'application/pdf',
+    'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+  ],
+  software: ['application/zip', 'application/x-zip-compressed', 'application/x-rar-compressed'],
+  softwareFile: ['application/zip', 'application/x-zip-compressed', 'application/x-rar-compressed'],
+  thumbnail: ['image/jpeg', 'image/png', 'image/jpg', 'image/gif', 'image/webp'],
+  avatar: ['image/jpeg', 'image/png', 'image/jpg', 'image/gif', 'image/webp']
+};
 
-const fileFilter = (req, file, cb) => {
-  const allowedMimes = {
-    documentation: ['application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
-    documentationFile: ['application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
-    software: ['application/zip', 'application/x-zip-compressed', 'application/x-rar-compressed'],
-    softwareFile: ['application/zip', 'application/x-zip-compressed', 'application/x-rar-compressed'],
-    thumbnail: ['image/jpeg', 'image/png', 'image/jpg', 'image/gif'],
-    avatar: ['image/jpeg', 'image/png', 'image/jpg', 'image/gif', 'image/webp']
-  };
+const makeFileFilter = (fallbackField) => (req, file, cb) => {
+  const normalized =
+    file.fieldname === 'documentationFile' ? 'documentation'
+      : file.fieldname === 'softwareFile' ? 'software'
+        : file.fieldname;
 
-  // Normalize fieldname for lookup
-  const fieldName = file.fieldname === 'documentationFile' ? 'documentation' : 
-                   file.fieldname === 'softwareFile' ? 'software' : file.fieldname;
-  const fieldMimes = allowedMimes[fieldName] || allowedMimes[file.fieldname] || [];
-  
+  const fieldMimes = allowedMimes[normalized] || allowedMimes[file.fieldname] || allowedMimes[fallbackField] || [];
+
   if (fieldMimes.length === 0 || fieldMimes.includes(file.mimetype)) {
     cb(null, true);
   } else {
@@ -57,13 +41,7 @@ const fileFilter = (req, file, cb) => {
   }
 };
 
-export const upload = multer({
-  storage: storage,
-  limits: {
-    fileSize: parseInt(process.env.MAX_FILE_SIZE) || 52428800 // 50MB default
-  },
-  fileFilter: fileFilter
-});
+const maxFileSize = parseInt(process.env.MAX_FILE_SIZE, 10) || 52428800;
 
 /**
  * Project file uploads are held in memory so they can be validated (extension,
@@ -73,7 +51,7 @@ export const upload = multer({
 const maxProjectFileSize = Math.max(
   parseInt(process.env.MAX_SOFTWARE_FILE_SIZE, 10) || 0,
   parseInt(process.env.MAX_DOCUMENTATION_FILE_SIZE, 10) || 0,
-  parseInt(process.env.MAX_FILE_SIZE, 10) || 0,
+  maxFileSize,
   52428800
 );
 
@@ -84,4 +62,22 @@ export const projectFileUpload = multer({
     files: 8,
     fields: 40
   }
+});
+
+/**
+ * Avatars are small images. The limit stays below Vercel's 4.5 MB payload cap
+ * so the request reaches this handler instead of failing at the edge.
+ */
+const maxAvatarFileSize = Math.min(
+  parseInt(process.env.MAX_IMAGE_SIZE, 10) || 4 * 1024 * 1024,
+  4 * 1024 * 1024
+);
+
+export const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: maxAvatarFileSize,
+    files: 1
+  },
+  fileFilter: makeFileFilter('avatar')
 });

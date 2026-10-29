@@ -565,6 +565,15 @@ test('10. archived resources disappear from the catalogue but keep history', asy
 
   await purchase('student', project.id, 'documentation');
 
+  // A project with order history cannot be deleted; archiving is the fallback
+  // that hides it without destroying the purchase.
+  const blockedDelete = await request(`/api/projects/${project.id}`, {
+    method: 'DELETE',
+    who: 'admin'
+  });
+  assert.equal(blockedDelete.status, 400, JSON.stringify(blockedDelete.body));
+  assert.match(blockedDelete.body.message, /Archive it instead/i);
+
   const archived = await request(`/api/projects/${project.id}/status`, {
     method: 'PATCH',
     who: 'admin',
@@ -577,6 +586,19 @@ test('10. archived resources disappear from the catalogue but keep history', asy
 
   const publicDetail = await request(`/api/projects/${project.id}`, { who: 'student' });
   assert.equal(publicDetail.status, 404);
+
+  // An admin browsing the storefront still only sees published projects.
+  const adminStorefront = await request(`/api/projects?search=${encodeURIComponent(project.title)}`, {
+    who: 'admin'
+  });
+  assert.equal(adminStorefront.body.total, 0);
+
+  // The admin table's default "all" view excludes archived projects too.
+  const adminAll = await request(
+    `/api/projects?search=${encodeURIComponent(project.title)}&status=all`,
+    { who: 'admin' }
+  );
+  assert.equal(adminAll.body.total, 0);
 
   const adminSearch = await request(
     `/api/projects?search=${encodeURIComponent(project.title)}&status=archived`,
@@ -774,9 +796,108 @@ test('12. paystack initialize, verify and signed webhook complete an order once'
   }
 });
 
+test('13. software can be declared before the installer is ready and attached later', async (t) => {
+  if (skipWithoutDb(t)) return;
+
+  const project = await createProject(
+    baseFields(`Pending Software ${Date.now()}`, {
+      status: 'published',
+      price: 1800,
+      hasSoftware: 'true',
+      softwareName: 'Pending Suite',
+      softwareVersion: '1.0.0',
+      softwareSaleMode: 'included',
+      softwareRedistributionAllowed: 'false'
+    }),
+    {
+      documentationFile: { name: 'pending.pdf', mime: 'application/pdf', buffer: pdf('pending docs') }
+    }
+  );
+
+  assert.equal(project.status, 'published');
+  assert.equal(project.hasSoftware, true);
+  assert.equal(project.hasInstaller, false);
+  assert.equal(project.softwareReady, false);
+  assert.equal(project.softwarePending, true);
+  assert.equal(project.softwareFiles.length, 0);
+  assert.equal(project.purchaseOptions.length, 1);
+  assert.equal(project.purchaseOptions[0].includesSoftware, false);
+  assert.equal(project.purchaseOptions[0].softwarePending, true);
+
+  const docFileId = project.documentationFiles[0].id;
+  await purchase('student', project.id, 'documentation');
+  assert.equal((await download('student', docFileId)).status, 200);
+
+  const earlySoftwareOrder = await request('/api/orders', {
+    method: 'POST',
+    who: 'student',
+    body: { items: [{ projectId: project.id, itemType: 'software' }] }
+  });
+  assert.equal(earlySoftwareOrder.status, 400);
+
+  const attached = await request(`/api/projects/${project.id}/software`, {
+    method: 'POST',
+    who: 'admin',
+    form: multipart(
+      { hasSoftware: 'true' },
+      { softwareInstaller: { name: 'pending.zip', mime: 'application/zip', buffer: zip('pending installer') } }
+    )
+  });
+
+  assert.equal(attached.status, 200, JSON.stringify(attached.body));
+  const updated = trackProject(attached.body.project);
+  assert.equal(updated.softwareReady, true);
+  assert.equal(updated.softwarePending, false);
+  assert.equal(updated.softwareFiles.length, 1);
+  assert.equal(updated.purchaseOptions[0].includesSoftware, true);
+
+  // The documentation was sold while the installer was pending; the included
+  // software becomes downloadable as soon as it is attached.
+  assert.equal((await download('student', updated.softwareFiles[0].id)).status, 200);
+});
+
+test('14. creates a software-only project without documentation', async (t) => {
+  if (skipWithoutDb(t)) return;
+
+  const project = await createProject(
+    baseFields(`Software Only ${Date.now()}`, {
+      status: 'published',
+      price: 0,
+      fullProjectPrice: 0,
+      hasSoftware: 'true',
+      softwareName: 'Standalone Suite',
+      softwareVersion: '2.0.0',
+      softwareSaleMode: 'separate',
+      softwarePrice: 1250,
+      softwareRedistributionAllowed: 'false'
+    }),
+    {
+      softwareInstaller: { name: 'standalone.zip', mime: 'application/zip', buffer: zip('standalone') }
+    }
+  );
+
+  assert.equal(project.status, 'published');
+  assert.equal(project.projectType, 'software');
+  assert.equal(project.hasSoftware, true);
+  assert.equal(project.hasDocumentation, false);
+  assert.equal(project.documentationFiles.length, 0);
+  assert.deepEqual(project.purchaseOptions.map((option) => option.type), ['software']);
+  assert.equal(Number(project.purchaseOptions[0].price), 1250);
+
+  const documentationOrder = await request('/api/orders', {
+    method: 'POST',
+    who: 'student2',
+    body: { items: [{ projectId: project.id, itemType: 'documentation' }] }
+  });
+  assert.equal(documentationOrder.status, 400);
+
+  await purchase('student2', project.id, 'software');
+  assert.equal((await download('student2', project.softwareFiles[0].id)).status, 200);
+});
+
 // Cleanup runs as the final test so the HTTP server and database are closed
 // deterministically even if an earlier assertion failed.
-test('13. clean up test data', async (t) => {
+test('15. clean up test data', async (t) => {
   if (skipWithoutDb(t)) return;
 
   // Tests 7/8 order real seeded projects with test students, so items must be

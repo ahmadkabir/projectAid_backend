@@ -1,6 +1,6 @@
-import fs from 'fs/promises';
 import path from 'path';
 import crypto from 'crypto';
+import mongoose from 'mongoose';
 import ProjectDocumentFile from '../models/ProjectDocumentFile.js';
 import {
   buildStorageKey,
@@ -9,8 +9,7 @@ import {
   isStorageConfigured,
   getStorageProvider,
   legacyPathForKey,
-  extensionOf,
-  __private as storagePrivate
+  extensionOf
 } from './storageService.js';
 import { validateUploadedFile } from './fileValidation.js';
 
@@ -48,27 +47,40 @@ export const assertStorageReady = () => {
   }
 };
 
-export const listProjectFiles = async (projectId, { includeSuperseded = false } = {}) => {
-  const where = { projectId };
-  if (!includeSuperseded) where.isCurrent = true;
-
-  return ProjectDocumentFile.findAll({
-    where,
-    order: [['createdAt', 'DESC'], ['id', 'DESC']]
-  });
+const buildProjectQuery = (projectId) => {
+  if (mongoose.Types.ObjectId.isValid(projectId) && String(new mongoose.Types.ObjectId(projectId)) === String(projectId)) {
+    return { project: projectId };
+  }
+  const numeric = Number(projectId);
+  if (!Number.isNaN(numeric)) {
+    return { $or: [{ projectIdLegacy: numeric }, { project: projectId }] };
+  }
+  return { project: projectId };
 };
 
-export const currentFileFor = async (projectId, category, { transaction } = {}) => {
-  return ProjectDocumentFile.findOne({
-    where: { projectId, category, isCurrent: true, uploadStatus: 'completed' },
-    order: [['createdAt', 'DESC'], ['id', 'DESC']],
-    transaction
-  });
+export const listProjectFiles = async (projectId, { includeSuperseded = false } = {}) => {
+  const query = buildProjectQuery(projectId);
+  if (!includeSuperseded) query.isCurrent = true;
+
+  return ProjectDocumentFile.find(query).sort({ createdAt: -1, _id: -1 });
+};
+
+export const currentFileFor = async (projectId, category, { session, transaction } = {}) => {
+  const activeSession = session || transaction?.session || (transaction instanceof mongoose.ClientSession ? transaction : null);
+  const query = {
+    ...buildProjectQuery(projectId),
+    category,
+    isCurrent: true,
+    uploadStatus: 'completed'
+  };
+
+  const findQuery = ProjectDocumentFile.findOne(query).sort({ createdAt: -1, _id: -1 });
+  if (activeSession) findQuery.session(activeSession);
+  return findQuery;
 };
 
 /**
  * Upload a file and record its metadata as the current file for its category.
- * Must be called inside a transaction when other database writes depend on it.
  */
 export const storeProjectFile = async ({
   projectId,
@@ -76,8 +88,10 @@ export const storeProjectFile = async ({
   file,
   createdBy = null,
   supersede = true,
+  session,
   transaction
 }) => {
+  const activeSession = session || transaction?.session || (transaction instanceof mongoose.ClientSession ? transaction : null);
   if (!FILE_CATEGORIES.includes(category)) {
     throw new UploadError(`Unsupported file category: ${category}`);
   }
@@ -99,32 +113,38 @@ export const storeProjectFile = async ({
   const saved = await saveBuffer(storageKey, file.buffer, { contentType: meta.mimeType });
 
   try {
+    const projectQuery = buildProjectQuery(projectId);
+
     if (supersede) {
-      await ProjectDocumentFile.update(
-        { isCurrent: false, supersededAt: new Date() },
-        { where: { projectId, category, isCurrent: true }, transaction }
+      const updateQuery = ProjectDocumentFile.updateMany(
+        { ...projectQuery, category, isCurrent: true },
+        { isCurrent: false, supersededAt: new Date() }
       );
+      if (activeSession) updateQuery.session(activeSession);
+      await updateQuery;
     }
 
-    return await ProjectDocumentFile.create(
-      {
-        projectId,
-        fileName: storageKey.split('/').pop(),
-        originalName: meta.originalName,
-        category,
-        fileType: meta.fileType,
-        filePath: legacyPathForKey(storageKey),
-        storageKey,
-        storageProvider: saved.provider,
-        mimeType: meta.mimeType,
-        fileSize: saved.size,
-        checksum: saved.checksum,
-        uploadStatus: 'completed',
-        isCurrent: true,
-        createdBy
-      },
-      { transaction }
-    );
+    const docData = {
+      project: mongoose.Types.ObjectId.isValid(projectId) ? projectId : undefined,
+      projectIdLegacy: !mongoose.Types.ObjectId.isValid(projectId) && !Number.isNaN(Number(projectId)) ? Number(projectId) : undefined,
+      fileName: storageKey.split('/').pop(),
+      originalName: meta.originalName,
+      category,
+      fileType: meta.fileType,
+      filePath: legacyPathForKey(storageKey),
+      storageKey,
+      storageProvider: saved.provider,
+      mimeType: meta.mimeType,
+      fileSize: saved.size,
+      checksum: saved.checksum,
+      uploadStatus: 'completed',
+      isCurrent: true,
+      createdBy
+    };
+
+    const doc = new ProjectDocumentFile(docData);
+    await doc.save({ session: activeSession });
+    return doc;
   } catch (error) {
     // The database rejected the record: remove the object we just wrote so no
     // orphan is left behind.
@@ -149,38 +169,46 @@ export const recordUploadedObject = async ({
   checksum = null,
   createdBy = null,
   supersede = true,
+  session,
   transaction
 }) => {
+  const activeSession = session || transaction?.session || (transaction instanceof mongoose.ClientSession ? transaction : null);
   if (!FILE_CATEGORIES.includes(category)) {
     throw new UploadError(`Unsupported file category: ${category}`);
   }
 
+  const projectQuery = buildProjectQuery(projectId);
+
   if (supersede) {
-    await ProjectDocumentFile.update(
-      { isCurrent: false, supersededAt: new Date() },
-      { where: { projectId, category, isCurrent: true }, transaction }
+    const updateQuery = ProjectDocumentFile.updateMany(
+      { ...projectQuery, category, isCurrent: true },
+      { isCurrent: false, supersededAt: new Date() }
     );
+    if (activeSession) updateQuery.session(activeSession);
+    await updateQuery;
   }
 
-  return ProjectDocumentFile.create(
-    {
-      projectId,
-      fileName: storageKey.split('/').pop(),
-      originalName,
-      category,
-      fileType,
-      filePath: legacyPathForKey(storageKey),
-      storageKey,
-      storageProvider: getStorageProvider(),
-      mimeType,
-      fileSize: size,
-      checksum,
-      uploadStatus: 'completed',
-      isCurrent: true,
-      createdBy
-    },
-    { transaction }
-  );
+  const docData = {
+    project: mongoose.Types.ObjectId.isValid(projectId) ? projectId : undefined,
+    projectIdLegacy: !mongoose.Types.ObjectId.isValid(projectId) && !Number.isNaN(Number(projectId)) ? Number(projectId) : undefined,
+    fileName: storageKey.split('/').pop(),
+    originalName,
+    category,
+    fileType,
+    filePath: legacyPathForKey(storageKey),
+    storageKey,
+    storageProvider: getStorageProvider(),
+    mimeType,
+    fileSize: size,
+    checksum,
+    uploadStatus: 'completed',
+    isCurrent: true,
+    createdBy
+  };
+
+  const doc = new ProjectDocumentFile(docData);
+  await doc.save({ session: activeSession });
+  return doc;
 };
 
 /**
@@ -194,9 +222,10 @@ export const cleanupUploadedObjects = async (keys = []) => {
 };
 
 /**
- * Cover images are public marketing assets, so they keep living in the
- * statically served uploads/thumbnails folder. Everything a customer pays for
- * goes through private storage instead.
+ * Cover images are public marketing assets. They use the same storage provider
+ * as everything else (local `uploads/thumbnails` in development, R2/S3 in
+ * production) because Vercel's filesystem is read-only. The public asset route
+ * in app.js streams them back at `/uploads/thumbnails/<file>`.
  */
 export const storePublicThumbnail = async (file) => {
   const validation = validateUploadedFile(file, 'thumbnail');
@@ -205,18 +234,16 @@ export const storePublicThumbnail = async (file) => {
   }
 
   const { meta } = validation;
-  const directory = path.resolve(storagePrivate.uploadsRoot, 'thumbnails');
-  await fs.mkdir(directory, { recursive: true });
-
   const fileName = `thumbnail-${Date.now()}-${crypto.randomBytes(6).toString('hex')}${extensionOf(meta.originalName)}`;
-  await fs.writeFile(path.join(directory, fileName), file.buffer);
+
+  await saveBuffer(`thumbnails/${fileName}`, file.buffer, { contentType: meta.mimeType });
   return fileName;
 };
 
 export const deletePublicThumbnail = async (fileName) => {
   if (!fileName) return;
   try {
-    await fs.unlink(path.resolve(storagePrivate.uploadsRoot, 'thumbnails', path.basename(fileName)));
+    await deleteObject(`thumbnails/${path.basename(fileName)}`);
   } catch {
     // Missing thumbnails are not an error.
   }
@@ -235,7 +262,6 @@ export const serializeFile = (file, { includeStorage = false } = {}) => {
     mimeType: plain.mimeType || null,
     fileSize: plain.fileSize || null,
     uploadStatus: plain.uploadStatus || 'completed',
-    // MySQL/MariaDB may hand back TINYINT(1) as 0/1 rather than a boolean.
     isCurrent: plain.isCurrent === true || plain.isCurrent === 1 || plain.isCurrent === '1',
     supersededAt: plain.supersededAt || null,
     createdAt: plain.createdAt,

@@ -18,7 +18,7 @@ router.post(
   authenticate,
   [
     body('items').isArray({ min: 1 }).withMessage('At least one item is required'),
-    body('items.*.projectId').isInt().withMessage('Valid project ID is required'),
+    body('items.*.projectId').notEmpty().withMessage('Valid project ID is required'),
     body('items.*.itemType').isIn(['documentation', 'software', 'full']).withMessage('Valid item type is required')
   ],
   createOrder

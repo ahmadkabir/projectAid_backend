@@ -15,10 +15,10 @@ router.post(
   '/',
   authenticate,
   [
-    body('projectId').isInt().withMessage('Valid project ID is required'),
+    body('projectId').notEmpty().withMessage('Valid project ID is required'),
     body('subject').trim().notEmpty().withMessage('Subject is required'),
     body('message').trim().notEmpty().withMessage('Message is required'),
-    body('orderId').optional().isInt()
+    body('orderId').optional().notEmpty()
   ],
   createSupportRequest
 );

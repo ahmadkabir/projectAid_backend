@@ -1,4 +1,5 @@
-import { Project, ProjectDocumentFile, Order, OrderItem } from '../models/index.js';
+import mongoose from 'mongoose';
+import { Project, ProjectDocumentFile, Order } from '../models/index.js';
 import { entitledCategories } from '../services/projectService.js';
 import {
   createReadStream,
@@ -9,6 +10,7 @@ import {
 } from '../services/storageService.js';
 import { extractPlainText } from '../services/documentTextService.js';
 import { buildPdfFromText, stampPdf } from '../services/watermarkedPdfService.js';
+import { streamBuffer } from '../utils/http.js';
 
 const SAFE_ASCII = /[^\x20-\x7e]/g;
 
@@ -18,18 +20,35 @@ const contentDisposition = (fileName) => {
 };
 
 const purchaseCoversFile = async (userId, project, category) => {
-  const items = await OrderItem.findAll({
-    where: { projectId: project.id },
-    include: [{
-      model: Order,
-      as: 'order',
-      where: { userId, status: 'completed' },
-      required: true,
-      attributes: ['id']
-    }]
+  const userFilters = [{ user: userId }];
+  if (mongoose.Types.ObjectId.isValid(userId)) {
+    userFilters.push({ user: new mongoose.Types.ObjectId(userId) });
+  }
+
+  const completedOrders = await Order.find({
+    $or: userFilters,
+    status: 'completed'
   });
 
-  return items.some((item) => entitledCategories(project, item.itemType).includes(category));
+  const matchingItems = [];
+  const targetId = project._id?.toString() || String(project.id);
+  const targetLegacy = project.legacyId !== undefined && project.legacyId !== null ? String(project.legacyId) : null;
+
+  for (const order of completedOrders) {
+    for (const item of order.items || []) {
+      const itemProjectId = item.project?._id?.toString() || (item.project ? String(item.project) : null);
+      const itemLegacy = item.projectIdLegacy !== undefined && item.projectIdLegacy !== null ? String(item.projectIdLegacy) : null;
+
+      if (
+        (itemProjectId && itemProjectId === targetId) ||
+        (targetLegacy && itemLegacy && itemLegacy === targetLegacy)
+      ) {
+        matchingItems.push(item);
+      }
+    }
+  }
+
+  return matchingItems.some((item) => entitledCategories(project, item.itemType).includes(category));
 };
 
 /**
@@ -37,13 +56,13 @@ const purchaseCoversFile = async (userId, project, category) => {
  * `{ file, project }` or `{ error, status }`.
  */
 const loadEntitledFile = async (req) => {
-  const file = await ProjectDocumentFile.findByPk(req.params.id);
+  const file = await ProjectDocumentFile.findByIdOrLegacy(req.params.id);
 
   if (!file || file.uploadStatus !== 'completed') {
     return { error: 'File not found', status: 404 };
   }
 
-  const project = await Project.findByPk(file.projectId);
+  const project = await Project.findByIdOrLegacy(file.projectId);
   if (!project) {
     return { error: 'File not found', status: 404 };
   }
@@ -199,12 +218,13 @@ export const getWatermarkedPdf = async (req, res) => {
       'Content-Disposition',
       `${disposition}; filename="${pdfFileName(project, file)}"`
     );
-    res.setHeader('Content-Length', String(pdfBuffer.length));
     res.setHeader('Cache-Control', 'private, no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
 
-    return res.send(pdfBuffer);
+    // Stream so documents larger than Vercel's 4.5 MB buffered response cap
+    // still reach the customer.
+    return streamBuffer(res, pdfBuffer);
   } catch (error) {
     console.error('Watermarked PDF error:', error);
     if (!res.headersSent) {

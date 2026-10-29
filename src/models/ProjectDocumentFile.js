@@ -1,104 +1,154 @@
-import { DataTypes } from 'sequelize';
-import sequelize from '../config/database.js';
+import mongoose from 'mongoose';
 
-/**
- * Metadata for every file attached to a project (documentation, software
- * installer, user guide). The binary lives in the configured object storage
- * provider; this table only stores metadata plus the storage key.
- */
-const ProjectDocumentFile = sequelize.define('ProjectDocumentFile', {
-  id: {
-    type: DataTypes.INTEGER,
-    primaryKey: true,
-    autoIncrement: true
-  },
-  projectId: {
-    type: DataTypes.INTEGER,
-    allowNull: false,
-    references: {
-      model: 'projects',
-      key: 'id'
+const projectDocumentFileSchema = new mongoose.Schema(
+  {
+    legacyId: {
+      type: Number,
+      index: true
     },
-    onDelete: 'CASCADE'
+    project: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Project',
+      required: true,
+      index: true
+    },
+    projectIdLegacy: {
+      type: Number,
+      index: true
+    },
+    fileName: {
+      type: String,
+      required: [true, 'File name is required']
+    },
+    originalName: {
+      type: String,
+      default: null
+    },
+    category: {
+      type: String,
+      enum: ['documentation', 'software', 'guide'],
+      default: 'documentation',
+      index: true
+    },
+    fileType: {
+      type: String,
+      enum: ['pdf', 'doc', 'docx', 'zip', 'rar'],
+      required: true
+    },
+    filePath: {
+      type: String,
+      default: null
+    },
+    storageKey: {
+      type: String,
+      default: null,
+      index: true
+    },
+    storageProvider: {
+      type: String,
+      default: 'local'
+    },
+    mimeType: {
+      type: String,
+      default: null
+    },
+    fileSize: {
+      type: Number,
+      default: null
+    },
+    checksum: {
+      type: String,
+      default: null
+    },
+    uploadStatus: {
+      type: String,
+      enum: ['pending', 'completed', 'failed'],
+      default: 'completed',
+      index: true
+    },
+    isCurrent: {
+      type: Boolean,
+      default: true,
+      index: true
+    },
+    supersededAt: {
+      type: Date,
+      default: null
+    },
+    archivedAt: {
+      type: Date,
+      default: null
+    },
+    createdBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null
+    }
   },
-  fileName: {
-    type: DataTypes.STRING,
-    allowNull: false,
-    comment: 'Stored file name (never trust the browser supplied name)'
-  },
-  originalName: {
-    type: DataTypes.STRING,
-    allowNull: true,
-    comment: 'Sanitised name supplied by the uploader, for display only'
-  },
-  category: {
-    type: DataTypes.ENUM('documentation', 'software', 'guide'),
-    allowNull: false,
-    defaultValue: 'documentation',
-    comment: 'What the file is: project documentation, software installer or user guide'
-  },
-  fileType: {
-    type: DataTypes.ENUM('pdf', 'doc', 'docx', 'zip', 'rar'),
-    allowNull: false
-  },
-  filePath: {
-    type: DataTypes.STRING(500),
-    allowNull: true,
-    comment: 'Legacy/human readable path (uploads/...). Use storageKey for lookups'
-  },
-  storageKey: {
-    type: DataTypes.STRING(500),
-    allowNull: true,
-    comment: 'Key of the object in the configured storage provider'
-  },
-  storageProvider: {
-    type: DataTypes.STRING(32),
-    allowNull: false,
-    defaultValue: 'local'
-  },
-  mimeType: {
-    type: DataTypes.STRING(150),
-    allowNull: true
-  },
-  fileSize: {
-    type: DataTypes.BIGINT,
-    allowNull: true
-  },
-  checksum: {
-    type: DataTypes.STRING(64),
-    allowNull: true,
-    comment: 'SHA-256 of the stored object'
-  },
-  uploadStatus: {
-    type: DataTypes.ENUM('pending', 'completed', 'failed'),
-    allowNull: false,
-    defaultValue: 'completed'
-  },
-  isCurrent: {
-    type: DataTypes.BOOLEAN,
-    allowNull: false,
-    defaultValue: true,
-    comment: 'False once the file has been replaced; kept for existing purchases'
-  },
-  supersededAt: {
-    type: DataTypes.DATE,
-    allowNull: true
-  },
-  archivedAt: {
-    type: DataTypes.DATE,
-    allowNull: true
-  },
-  createdBy: {
-    type: DataTypes.INTEGER,
-    allowNull: true,
-    references: {
-      model: 'users',
-      key: 'id'
+  {
+    collection: 'projectdocumentfiles',
+    timestamps: true,
+    toJSON: {
+      virtuals: true,
+      transform: (doc, ret) => {
+        ret.id = ret._id.toString();
+        if (ret.project && typeof ret.project === 'object' && ret.project._id) {
+          ret.projectId = ret.project._id.toString();
+        } else if (ret.project) {
+          ret.projectId = ret.project.toString();
+        } else if (ret.projectIdLegacy) {
+          ret.projectId = ret.projectIdLegacy;
+        }
+        delete ret.__v;
+        return ret;
+      }
+    },
+    toObject: {
+      virtuals: true,
+      transform: (doc, ret) => {
+        ret.id = ret._id.toString();
+        if (ret.project && typeof ret.project === 'object' && ret.project._id) {
+          ret.projectId = ret.project._id.toString();
+        } else if (ret.project) {
+          ret.projectId = ret.project.toString();
+        } else if (ret.projectIdLegacy) {
+          ret.projectId = ret.projectIdLegacy;
+        }
+        delete ret.__v;
+        return ret;
+      }
     }
   }
-}, {
-  tableName: 'project_document_files',
-  timestamps: true
-});
+);
+
+projectDocumentFileSchema.virtual('projectId')
+  .get(function () {
+    if (this.project && typeof this.project === 'object' && this.project._id) {
+      return this.project._id.toString();
+    }
+    return this.project ? this.project.toString() : (this.projectIdLegacy || null);
+  })
+  .set(function (val) {
+    if (mongoose.Types.ObjectId.isValid(val)) {
+      this.project = val;
+    } else if (val) {
+      this.projectIdLegacy = Number(val);
+    }
+  });
+
+projectDocumentFileSchema.statics.findByIdOrLegacy = function (id) {
+  if (!id) return null;
+  if (mongoose.Types.ObjectId.isValid(id) && String(new mongoose.Types.ObjectId(id)) === String(id)) {
+    return this.findById(id);
+  }
+  const numeric = Number(id);
+  if (!Number.isNaN(numeric)) {
+    return this.findOne({ legacyId: numeric });
+  }
+  return this.findById(id);
+};
+
+const ProjectDocumentFile =
+  mongoose.models.ProjectDocumentFile || mongoose.model('ProjectDocumentFile', projectDocumentFileSchema);
 
 export default ProjectDocumentFile;

@@ -1,3 +1,4 @@
+import mongoose from 'mongoose';
 import { validationResult } from 'express-validator';
 import { SupportRequest, Project, User, Order } from '../models/index.js';
 
@@ -10,43 +11,33 @@ export const createSupportRequest = async (req, res) => {
 
     const { projectId, orderId, subject, message } = req.body;
 
-    // Verify project exists
-    const project = await Project.findByPk(projectId);
+    const project = await Project.findByIdOrLegacy(projectId);
     if (!project) {
       return res.status(404).json({ message: 'Project not found' });
     }
 
-    // If orderId provided, verify it belongs to user
+    let resolvedOrder = null;
     if (orderId) {
-      const order = await Order.findByPk(orderId);
-      if (!order || order.userId !== req.user.id) {
+      resolvedOrder = await Order.findByIdOrLegacy(orderId);
+      const orderUserId = resolvedOrder?.user?._id?.toString() || resolvedOrder?.user?.toString();
+      const currentUserId = req.user._id?.toString() || req.user.id?.toString();
+      if (!resolvedOrder || orderUserId !== currentUserId) {
         return res.status(403).json({ message: 'Invalid order' });
       }
     }
 
     const supportRequest = await SupportRequest.create({
-      userId: req.user.id,
-      projectId,
-      orderId: orderId || null,
+      user: req.user._id || req.user.id,
+      project: project._id,
+      order: resolvedOrder?._id || null,
       subject,
       message,
       status: 'open'
     });
 
-    const createdRequest = await SupportRequest.findByPk(supportRequest.id, {
-      include: [
-        {
-          model: Project,
-          as: 'project',
-          attributes: ['id', 'title']
-        },
-        {
-          model: User,
-          as: 'user',
-          attributes: ['id', 'name', 'email']
-        }
-      ]
-    });
+    const createdRequest = await SupportRequest.findById(supportRequest._id)
+      .populate('project', 'id title')
+      .populate('user', 'id name email');
 
     res.status(201).json({
       message: 'Support request created successfully',
@@ -60,15 +51,15 @@ export const createSupportRequest = async (req, res) => {
 
 export const getUserSupportRequests = async (req, res) => {
   try {
-    const supportRequests = await SupportRequest.findAll({
-      where: { userId: req.user.id },
-      include: [{
-        model: Project,
-        as: 'project',
-        attributes: ['id', 'title', 'thumbnail']
-      }],
-      order: [['createdAt', 'DESC']]
-    });
+    const currentUserId = req.user._id || req.user.id;
+    const supportRequests = await SupportRequest.find({
+      $or: [
+        { user: currentUserId },
+        ...(mongoose.Types.ObjectId.isValid(currentUserId) ? [{ user: new mongoose.Types.ObjectId(currentUserId) }] : [])
+      ]
+    })
+      .populate('project', 'id title thumbnail')
+      .sort({ createdAt: -1 });
 
     res.json({ supportRequests });
   } catch (error) {
@@ -79,21 +70,10 @@ export const getUserSupportRequests = async (req, res) => {
 
 export const getAllSupportRequests = async (req, res) => {
   try {
-    const supportRequests = await SupportRequest.findAll({
-      include: [
-        {
-          model: Project,
-          as: 'project',
-          attributes: ['id', 'title']
-        },
-        {
-          model: User,
-          as: 'user',
-          attributes: ['id', 'name', 'email']
-        }
-      ],
-      order: [['createdAt', 'DESC']]
-    });
+    const supportRequests = await SupportRequest.find()
+      .populate('project', 'id title')
+      .populate('user', 'id name email')
+      .sort({ createdAt: -1 });
 
     res.json({ supportRequests });
   } catch (error) {
@@ -109,14 +89,17 @@ export const updateSupportRequest = async (req, res) => {
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const supportRequest = await SupportRequest.findByPk(req.params.id);
+    const supportRequest = await SupportRequest.findByIdOrLegacy(req.params.id);
     if (!supportRequest) {
       return res.status(404).json({ message: 'Support request not found' });
     }
 
+    const requestUserId = supportRequest.user?._id?.toString() || supportRequest.user?.toString();
+    const currentUserId = req.user._id?.toString() || req.user.id?.toString();
+
     // Users can only update their own requests if status is open
     if (req.user.role !== 'admin') {
-      if (supportRequest.userId !== req.user.id) {
+      if (requestUserId !== currentUserId) {
         return res.status(403).json({ message: 'Access denied' });
       }
       if (supportRequest.status !== 'open') {
@@ -136,20 +119,9 @@ export const updateSupportRequest = async (req, res) => {
 
     await supportRequest.save();
 
-    const updatedRequest = await SupportRequest.findByPk(supportRequest.id, {
-      include: [
-        {
-          model: Project,
-          as: 'project',
-          attributes: ['id', 'title']
-        },
-        {
-          model: User,
-          as: 'user',
-          attributes: ['id', 'name', 'email']
-        }
-      ]
-    });
+    const updatedRequest = await SupportRequest.findById(supportRequest._id)
+      .populate('project', 'id title')
+      .populate('user', 'id name email');
 
     res.json({
       message: 'Support request updated successfully',
@@ -163,29 +135,21 @@ export const updateSupportRequest = async (req, res) => {
 
 export const getSupportRequestById = async (req, res) => {
   try {
-    const supportRequest = await SupportRequest.findByPk(req.params.id, {
-      include: [
-        {
-          model: Project,
-          as: 'project',
-          include: [{
-            model: ProjectCategory,
-            as: 'category'
-          }]
-        },
-        {
-          model: User,
-          as: 'user',
-          attributes: ['id', 'name', 'email']
-        }
-      ]
-    });
+    const supportRequest = await SupportRequest.findByIdOrLegacy(req.params.id)
+      .populate({
+        path: 'project',
+        populate: { path: 'category' }
+      })
+      .populate('user', 'id name email');
 
     if (!supportRequest) {
       return res.status(404).json({ message: 'Support request not found' });
     }
 
-    if (supportRequest.userId !== req.user.id && req.user.role !== 'admin') {
+    const requestUserId = supportRequest.user?._id?.toString() || supportRequest.user?.toString();
+    const currentUserId = req.user._id?.toString() || req.user.id?.toString();
+
+    if (requestUserId !== currentUserId && req.user.role !== 'admin') {
       return res.status(403).json({ message: 'Access denied' });
     }
 

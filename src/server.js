@@ -1,15 +1,12 @@
-import dotenv from 'dotenv';
+import './config/env.js';
 import app from './app.js';
-import sequelize from './config/database.js';
-
-dotenv.config();
+import { connectDatabase } from './config/mongo.js';
 
 const PORT = process.env.PORT || 5000;
 
 async function startServer() {
   try {
-    await sequelize.authenticate();
-    console.log('Database connection established successfully.');
+    await connectDatabase();
 
     const server = app.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);
@@ -28,9 +25,16 @@ async function startServer() {
       }
     });
   } catch (error) {
-    console.error('Unable to connect to the database:', error);
+    console.error('Unable to connect to the database:', error.message);
     process.exit(1);
   }
 }
 
-startServer();
+// Vercel imports this module and uses the exported Express app; starting a
+// listener there is neither needed nor supported. Local development (`npm run
+// dev` / `npm start`) keeps the traditional long-running server.
+if (process.env.VERCEL !== '1') {
+  startServer();
+}
+
+export default app;

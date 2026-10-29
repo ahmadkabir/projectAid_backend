@@ -1,7 +1,7 @@
 import { validationResult } from 'express-validator';
 import jwt from 'jsonwebtoken';
-import { Op } from 'sequelize';
-import sequelize from '../config/database.js';
+import mongoose from 'mongoose';
+import { startDbTransaction } from '../config/mongo.js';
 import {
   Project,
   ProjectCategory,
@@ -36,6 +36,7 @@ import { deleteObject, getStorageProvider } from '../services/storageService.js'
 import { extractProjectDocumentationText } from '../services/documentTextService.js';
 import { buildPdfFromText } from '../services/watermarkedPdfService.js';
 import { createUploadTicket, finalizeUpload } from '../services/directUploadService.js';
+import { streamBuffer } from '../utils/http.js';
 
 const VALID_LEVELS = ['ND', 'HND', 'BSc', 'MSc'];
 
@@ -104,8 +105,6 @@ const serializeProject = (project, { includeSuperseded = false, includeStorage =
 
   const allFiles = (plain.documentFiles || []).map((file) => serializeFile(file, { includeStorage }));
   const currentFiles = allFiles.filter((file) => file.isCurrent);
-  // `files` carries the full history for administrators; the per-category
-  // arrays always describe what is current so downloads and counts stay sane.
   const files = includeSuperseded ? allFiles : currentFiles;
 
   const documentationFiles = currentFiles.filter((file) => file.category === 'documentation');
@@ -118,7 +117,6 @@ const serializeProject = (project, { includeSuperseded = false, includeStorage =
 
   const result = {
     ...plain,
-    // Legacy alias kept so older screens/components keep working.
     documentFiles: files,
     files,
     documentationFiles,
@@ -127,6 +125,8 @@ const serializeProject = (project, { includeSuperseded = false, includeStorage =
     hasDocumentation,
     hasInstaller,
     hasSoftware: softwareEnabled,
+    softwareReady: hasInstaller,
+    softwarePending: softwareEnabled && !hasInstaller,
     softwareSaleMode: saleModeOf(plain),
     purchaseOptions: getPurchaseOptions(plain, { hasDocumentationFile: hasDocumentation, hasInstaller }),
     isPublished: normalizeStatus(plain.status) === 'published'
@@ -136,31 +136,31 @@ const serializeProject = (project, { includeSuperseded = false, includeStorage =
   return result;
 };
 
-const projectInclude = [
-  {
-    model: ProjectCategory,
-    as: 'category',
-    attributes: ['id', 'name', 'description']
-  },
-  {
-    model: ProjectDocumentFile,
-    as: 'documentFiles',
-    attributes: [
-      'id', 'projectId', 'fileName', 'originalName', 'category', 'fileType', 'mimeType',
-      'fileSize', 'uploadStatus', 'isCurrent', 'supersededAt', 'storageKey',
-      'storageProvider', 'filePath', 'createdAt'
-    ]
-  }
-];
+const fetchProjectWithFiles = async (id) => {
+  const project = await Project.findByIdOrLegacy(id).populate('category');
+  if (!project) return null;
 
-const fetchProjectWithFiles = (id, options = {}) =>
-  Project.findByPk(id, { include: projectInclude, ...options });
+  const projectDoc = project.toJSON ? project.toJSON() : { ...project };
+
+  const files = await ProjectDocumentFile.find({
+    $or: [
+      { project: project._id },
+      ...(project.legacyId ? [{ projectIdLegacy: project.legacyId }] : [])
+    ]
+  }).sort({ createdAt: -1 });
+
+  projectDoc.documentFiles = files.map((f) => (f.toJSON ? f.toJSON() : f));
+  return projectDoc;
+};
 
 const respondWithProject = async (res, projectId, statusCode, message, options = {}) => {
-  const project = await fetchProjectWithFiles(projectId, options.queryOptions);
+  const project = await fetchProjectWithFiles(projectId);
   return res.status(statusCode).json({
     ...(message ? { message } : {}),
-    project: serializeProject(project, { includeSuperseded: options.includeSuperseded, includeStorage: options.includeStorage })
+    project: serializeProject(project, {
+      includeSuperseded: options.includeSuperseded,
+      includeStorage: options.includeStorage
+    })
   });
 };
 
@@ -178,13 +178,12 @@ const uploadErrorResponse = (res, error) => {
 };
 
 const resolveCourse = async (courseId) => {
-  const course = await ProjectCategory.findByPk(courseId);
+  const course = await ProjectCategory.findByIdOrLegacy(courseId);
   return course || null;
 };
 
 /**
- * Build the canonical project fields from a request body. Only fields present
- * in the body are written, so partial updates keep the existing values.
+ * Build the canonical project fields from a request body.
  */
 const applyProjectFields = (project, body, { creating = false } = {}) => {
   if (creating || hasField(body, 'title')) project.title = String(body.title || '').trim();
@@ -192,7 +191,11 @@ const applyProjectFields = (project, body, { creating = false } = {}) => {
 
   const courseId = body.course || body.categoryId;
   if (courseId !== undefined && courseId !== null && courseId !== '') {
-    project.categoryId = parseInt(courseId, 10);
+    if (mongoose.Types.ObjectId.isValid(courseId)) {
+      project.category = courseId;
+    } else {
+      project.categoryIdLegacy = parseInt(courseId, 10);
+    }
   }
 
   if (creating || hasField(body, 'level')) project.level = body.level || null;
@@ -204,18 +207,15 @@ const applyProjectFields = (project, body, { creating = false } = {}) => {
   const status = normalizeStatus(body.status);
   if (status) project.status = status;
 
-  // Documentation price is the primary price; the legacy columns stay in sync.
   if (hasField(body, 'price') || hasField(body, 'documentationPrice') || creating) {
     const docPrice = toNumber(body.price ?? body.documentationPrice);
     project.price = docPrice;
     project.documentationPrice = docPrice;
   }
 
-  // --- software metadata ---------------------------------------------------
   const choice = parseBoolean(body.hasSoftware ?? body.softwareAvailable);
 
   if (choice === false || parseBoolean(body.removeSoftware) === true) {
-    // Archiving keeps the files and metadata for existing purchases.
     project.softwareStatus = 'archived';
   } else if (choice === true) {
     project.softwareStatus = 'active';
@@ -253,7 +253,6 @@ const syncDerivedFields = (project, body = {}) => {
   }
 
   if (mode !== 'separate') {
-    // Included software has no separate price and no bundle price.
     if (hasActiveSoftware(project)) project.softwarePrice = 0;
     project.fullProjectPrice = 0;
   } else {
@@ -268,10 +267,10 @@ const syncDerivedFields = (project, body = {}) => {
   if (project.status === null || project.status === undefined) project.status = 'draft';
 };
 
-const validateForStatus = async (project, status, { tx, hasDocumentationFile, hasInstaller } = {}) => {
+const validateForStatus = async (project, status, { session, hasDocumentationFile, hasInstaller } = {}) => {
   const data = project.toJSON ? project.toJSON() : project;
-  const docAvailable = hasDocumentationFile ?? await documentationAvailable(project.id, data.documentationFile, { transaction: tx });
-  const installerAvailable = hasInstaller ?? await softwareAvailable(project.id, data.softwareFile, { transaction: tx });
+  const docAvailable = hasDocumentationFile ?? await documentationAvailable(project.id, data.documentationFile, { session });
+  const installerAvailable = hasInstaller ?? await softwareAvailable(project.id, data.softwareFile, { session });
 
   return validateProjectForStatus({
     data: { ...data, documentationPrice: toNumber(data.documentationPrice ?? data.price) },
@@ -281,10 +280,6 @@ const validateForStatus = async (project, status, { tx, hasDocumentationFile, ha
     softwareEnabled: hasActiveSoftware(data)
   });
 };
-
-// ---------------------------------------------------------------------------
-// Public / shared reads
-// ---------------------------------------------------------------------------
 
 export const getAllProjects = async (req, res) => {
   try {
@@ -301,70 +296,68 @@ export const getAllProjects = async (req, res) => {
     } = req.query;
 
     const isAdmin = req.user?.role === 'admin';
-    const baseWhere = {};
+    const query = {};
+    const requestedStatus = normalizeStatus(status);
 
-    if (isAdmin) {
-      const requestedStatus = normalizeStatus(status);
-      if (requestedStatus) baseWhere.status = requestedStatus;
+    if (isAdmin && status === 'all') {
+      query.status = { $ne: 'archived' };
+    } else if (isAdmin && requestedStatus) {
+      query.status = requestedStatus;
     } else {
-      // Customers only ever see published resources.
-      baseWhere.status = 'published';
+      query.status = { $in: ['published', 'active'] };
     }
 
     if (category && category !== 'all') {
-      baseWhere.categoryId = category;
+      if (mongoose.Types.ObjectId.isValid(category)) {
+        query.category = category;
+      } else if (!Number.isNaN(Number(category))) {
+        query.$or = [{ categoryIdLegacy: Number(category) }, { category: category }];
+      } else {
+        query.category = category;
+      }
     }
 
     if (startDate || endDate) {
-      baseWhere.createdAt = {};
-      if (startDate) baseWhere.createdAt[Op.gte] = new Date(startDate);
+      query.createdAt = {};
+      if (startDate) query.createdAt.$gte = new Date(startDate);
       if (endDate) {
         const end = new Date(endDate);
         end.setHours(23, 59, 59, 999);
-        baseWhere.createdAt[Op.lte] = end;
+        query.createdAt.$lte = end;
       }
     }
 
     const requestedType = (type || projectType)?.toLowerCase()?.trim();
-    const andConditions = [];
-
     if (requestedType) {
       if (requestedType === 'documentation') {
-        andConditions.push({
-          [Op.or]: [
+        query.$and = query.$and || [];
+        query.$and.push({
+          $or: [
             { projectType: 'documentation' },
             { projectType: null },
             { softwareStatus: 'archived' }
           ]
         });
       } else if (requestedType === 'software') {
-        // "Has software" means an active software resource, regardless of the
-        // legacy projectType value.
-        andConditions.push({ softwareStatus: 'active' });
+        query.softwareStatus = 'active';
       } else {
         return res.json({ success: true, projects: [], total: 0 });
       }
     }
 
     if (search) {
-      const like = { [Op.like]: `%${search}%` };
-      andConditions.push({
-        [Op.or]: [
-          { title: like },
-          { description: like },
-          { '$category.name$': like }
-        ]
-      });
+      const regex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      const matchingCats = await ProjectCategory.find({ name: regex }).select('_id');
+      const catIds = matchingCats.map((c) => c._id);
+
+      const searchOr = [
+        { title: regex },
+        { description: regex },
+        { category: { $in: catIds } }
+      ];
+      query.$and = query.$and || [];
+      query.$and.push({ $or: searchOr });
     }
-
-    const finalWhere = { ...baseWhere };
-    if (andConditions.length > 0) finalWhere[Op.and] = andConditions;
-
-    const include = [{
-      model: ProjectCategory,
-      as: 'category',
-      attributes: ['id', 'name']
-    }];
 
     const pageNumber = page ? parseInt(page, 10) : null;
     const pageSize = limit ? parseInt(limit, 10) : 10;
@@ -375,22 +368,18 @@ export const getAllProjects = async (req, res) => {
     let pagination;
 
     if (shouldPaginate) {
-      const { rows, count } = await Project.findAndCountAll({
-        where: finalWhere,
-        include,
-        order: [['createdAt', 'DESC']],
-        limit: pageSize,
-        offset: (pageNumber - 1) * pageSize
-      });
-      projects = rows;
-      total = count;
+      const skip = (pageNumber - 1) * pageSize;
+      total = await Project.countDocuments(query);
+      projects = await Project.find(query)
+        .populate('category')
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(pageSize);
       pagination = { page: pageNumber, pageSize, total };
     } else {
-      projects = await Project.findAll({
-        where: finalWhere,
-        include,
-        order: [['createdAt', 'DESC']]
-      });
+      projects = await Project.find(query)
+        .populate('category')
+        .sort({ createdAt: -1 });
       total = projects.length;
     }
 
@@ -416,8 +405,6 @@ export const getProjectById = async (req, res) => {
     }
 
     if (!isAdmin && normalizeStatus(project.status) !== 'published') {
-      // Drafts, resources awaiting review and archived resources are invisible
-      // to customers, including by guessing the id.
       return res.status(404).json({ message: 'Project not found' });
     }
 
@@ -433,7 +420,6 @@ export const getProjectById = async (req, res) => {
   }
 };
 
-// Number of characters of the document a visitor may read before paying.
 const FREE_SAMPLE_LENGTH = 2200;
 const MIN_SAMPLE_LENGTH = 400;
 const SHORT_DOC_SAMPLE_RATIO = 0.55;
@@ -447,7 +433,6 @@ const SECTION_TITLE_PATTERNS = [
 
 const buildSample = (content) => {
   if (content.length <= FREE_SAMPLE_LENGTH) {
-    // Short documents still keep a portion locked so the preview stays a sample.
     const limit = Math.max(MIN_SAMPLE_LENGTH, Math.floor(content.length * SHORT_DOC_SAMPLE_RATIO));
     if (content.length <= limit) {
       return { sample: content, sampleEnd: content.length };
@@ -497,10 +482,6 @@ const buildLockedSections = (content, sampleEnd) => {
   return sections;
 };
 
-/**
- * Shared resolver for the public preview (HTML metadata and PDF rendering).
- * Returns `{ error }` for requests that must be rejected.
- */
 const resolveDocumentPreview = async (req) => {
   const project = await fetchProjectWithFiles(req.params.id);
   if (!project) {
@@ -517,36 +498,45 @@ const resolveDocumentPreview = async (req) => {
     }
   }
 
-  const user = userId ? await User.findByPk(userId) : null;
+  const user = userId ? await User.findByIdOrLegacy(userId) : null;
   const isAdmin = user?.role === 'admin';
 
   if (!isAdmin && normalizeStatus(project.status) !== 'published') {
     return { error: { status: 404, message: 'Project not found' } };
   }
 
-  // Admins see the customer-facing sample by default; they can request the
-  // full text explicitly with ?full=1 from the preview page toggle.
   const wantsFull = String(req.query.full || '') === '1';
   let unlocked = isAdmin && wantsFull;
+
   if (userId && !unlocked) {
+    const userFilters = [{ user: userId }];
+    if (mongoose.Types.ObjectId.isValid(userId)) {
+      userFilters.push({ user: new mongoose.Types.ObjectId(userId) });
+    }
+
     const completedOrder = await Order.findOne({
-      where: { userId, status: 'completed' },
-      include: [{
-        model: OrderItem,
-        as: 'items',
-        where: { projectId: project.id, itemType: ['documentation', 'full'] },
-        required: true
-      }]
+      $or: userFilters,
+      status: 'completed',
+      items: {
+        $elemMatch: {
+          $or: [
+            { project: project._id || project.id },
+            ...(project.legacyId ? [{ projectIdLegacy: project.legacyId }] : [])
+          ],
+          itemType: { $in: ['documentation', 'full'] }
+        }
+      }
     });
     unlocked = Boolean(completedOrder);
   }
 
   let document = await ProjectDocument.findOne({
-    where: { projectId: project.id }
+    $or: [
+      { project: project._id || project.id },
+      ...(project.legacyId ? [{ projectIdLegacy: project.legacyId }] : [])
+    ]
   });
 
-  // Uploaded documentation files (PDF/DOCX) have no stored text yet; extract
-  // it so visitors still get a restricted sample instead of an empty state.
   if (!document) {
     const extracted = await extractProjectDocumentationText(project);
     if (extracted) document = { content: extracted.text };
@@ -563,11 +553,6 @@ const resolveDocumentPreview = async (req) => {
   };
 };
 
-/**
- * Public document preview. Visitors get a server-redacted sample plus the list
- * of locked sections; buyers with a completed documentation order get the full
- * text.
- */
 export const getDocumentPreview = async (req, res) => {
   try {
     const resolved = await resolveDocumentPreview(req);
@@ -592,61 +577,33 @@ export const getDocumentPreview = async (req, res) => {
       },
       available: Boolean(document),
       unlocked,
-      documentFiles: projectData.documentationFiles
+      sample: '',
+      lockedSections: []
     };
 
-    if (!document) {
-      const hasAttachedFile = Boolean(projectData.documentationFile) ||
-        (projectData.documentationFiles || []).length > 0;
-
-      return res.json({
-        ...payload,
-        sample: null,
-        lockedSections: [],
-        teaser: project.summary || project.description || null,
-        message: hasAttachedFile
-          ? 'The attached document could not be converted into a preview automatically.'
-          : 'No written preview is available for this project yet.'
-      });
+    if (!document?.content) {
+      return res.json(payload);
     }
+
+    const content = String(document.content);
 
     if (unlocked) {
-      return res.json({
-        ...payload,
-        content: document.content,
-        totalLength: document.content.length
-      });
+      payload.sample = content;
+      payload.lockedSections = [];
+      return res.json(payload);
     }
 
-    const { sample, sampleEnd } = buildSample(document.content);
-    const lockedSections = buildLockedSections(document.content, sampleEnd);
+    const { sample, sampleEnd } = buildSample(content);
+    payload.sample = sample;
+    payload.lockedSections = buildLockedSections(content, sampleEnd);
 
-    return res.json({
-      ...payload,
-      sample,
-      lockedSections,
-      totalLength: document.content.length
-    });
+    return res.json(payload);
   } catch (error) {
-    console.error('Get document preview error:', error);
-    res.status(500).json({ message: 'Server error building document preview' });
+    console.error('Document preview error:', error);
+    return res.status(500).json({ message: 'Server error reading document preview' });
   }
 };
 
-const previewPdfFileName = (project, unlocked) => {
-  const base = String(project.title || 'project')
-    .replace(/[^\w\s-]+/g, '')
-    .trim()
-    .replace(/\s+/g, '-')
-    .slice(0, 60);
-  return `${base || 'project'}-${unlocked ? 'document' : 'sample'}.pdf`;
-};
-
-/**
- * The preview as a real PDF. Every page carries the ProjectAid watermark and a
- * "Page X of Y" footer. Visitors receive only the free sample; buyers/admins
- * (with ?full=1) receive the full document.
- */
 export const getDocumentPreviewPdf = async (req, res) => {
   try {
     const resolved = await resolveDocumentPreview(req);
@@ -654,59 +611,63 @@ export const getDocumentPreviewPdf = async (req, res) => {
       return res.status(resolved.error.status).json({ message: resolved.error.message });
     }
 
-    const { project, user, unlocked, document } = resolved;
+    const { project, user, isAdmin, unlocked, document } = resolved;
 
-    if (!document?.content || !String(document.content).trim()) {
-      return res.status(404).json({
-        message: 'No written preview is available for this project yet.'
-      });
+    if (!document?.content) {
+      return res.status(404).json({ message: 'No document available to render' });
     }
 
-    const text = unlocked ? document.content : buildSample(document.content).sample;
-    const licensedTo = [user?.name, user?.email].filter(Boolean).join(' | ');
-    const stampDate = new Date().toLocaleDateString('en-GB', {
+    const content = String(document.content);
+    let renderText = content;
+    let watermarkText = 'ProjectAid Preview';
+
+    if (unlocked) {
+      const buyerName = user?.name || 'Authorized Buyer';
+      const buyerEmail = user?.email || '';
+      watermarkText = `ProjectAid | Licensed to ${buyerName} | ${buyerEmail}`.trim();
+    } else {
+      const { sample } = buildSample(content);
+      const notice =
+        '\n\n[ --- PREVIEW ENDS HERE --- Full document unlocked after purchase at ProjectAid --- ]';
+      renderText = `${sample}${notice}`;
+    }
+
+    const dateStr = new Date().toLocaleDateString('en-GB', {
       day: '2-digit',
       month: 'short',
       year: 'numeric'
     });
 
-    const watermark = unlocked
-      ? `ProjectAid | Licensed to ${licensedTo || 'customer'}`
-      : 'ProjectAid | FREE SAMPLE - Purchase to unlock the full document';
-    const footer = unlocked
-      ? `ProjectAid - Licensed to ${licensedTo || 'customer'} - ${stampDate}`
-      : `ProjectAid - Free watermarked sample - ${stampDate}`;
-
-    const pdf = await buildPdfFromText({
+    const pdfBuffer = await buildPdfFromText({
       title: project.title,
-      text,
-      watermark,
-      footer
+      text: renderText,
+      watermark: watermarkText,
+      footer: `ProjectAid - ${unlocked ? 'Purchased Documentation' : 'Sample Preview'} - ${dateStr}`
     });
 
+    const baseName = (project.title || 'project')
+      .replace(/[^\w\s-]+/g, '')
+      .replace(/\s+/g, '_')
+      .slice(0, 80);
+    const downloadName = `${baseName || 'project'}_preview.pdf`;
+
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader(
-      'Content-Disposition',
-      `inline; filename="${previewPdfFileName(project, unlocked)}"`
-    );
-    res.setHeader('Content-Length', String(pdf.length));
+    res.setHeader('Content-Disposition', `inline; filename="${downloadName}"`);
     res.setHeader('Cache-Control', 'private, no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
 
-    return res.send(pdf);
+    // Stream so previews larger than Vercel's 4.5 MB buffered response cap are
+    // delivered successfully.
+    return streamBuffer(res, pdfBuffer);
   } catch (error) {
-    console.error('Get document preview PDF error:', error);
+    console.error('Document preview PDF error:', error);
     if (!res.headersSent) {
-      return res.status(500).json({ message: 'Server error building document preview' });
+      return res.status(500).json({ message: 'Server error rendering preview PDF' });
     }
     return undefined;
   }
 };
-
-// ---------------------------------------------------------------------------
-// Admin writes
-// ---------------------------------------------------------------------------
 
 export const createProject = async (req, res) => {
   const errors = validationResult(req);
@@ -720,34 +681,27 @@ export const createProject = async (req, res) => {
 
   try {
     const body = req.body;
-    const courseId = body.course || body.categoryId;
-
-    if (!courseId) return res.status(400).json({ message: 'Course is required' });
-
-    const course = await resolveCourse(courseId);
-    if (!course) return res.status(400).json({ message: 'Invalid course selected' });
-
-    if (!body.level) {
-      return res.status(400).json({ message: 'Level is required. Must be ND, HND, BSc, or MSc' });
-    }
-    if (!VALID_LEVELS.includes(body.level)) {
-      return res.status(400).json({ message: 'Invalid level. Must be ND, HND, BSc, or MSc' });
-    }
-
-    const status = normalizeStatus(body.status) || 'draft';
     const uploads = uploadedFileNames(req.files);
 
-    // Validate every upload before touching storage or the database.
     assertUpload(uploads.documentation, 'documentation');
     assertUpload(uploads.software, 'software');
     assertUpload(uploads.guide, 'guide');
     assertUpload(uploads.thumbnail, 'thumbnail');
 
-    const project = Project.build({});
-    applyProjectFields(project, { ...body, status }, { creating: true });
+    if (hasField(body, 'level') && body.level && !VALID_LEVELS.includes(body.level)) {
+      return res.status(400).json({ message: 'Invalid level. Must be ND, HND, BSc, or MSc' });
+    }
 
-    const softwareEnabled = hasActiveSoftware(project) || Boolean(uploads.software) || Boolean(uploads.guide);
-    if (softwareEnabled) {
+    const courseId = body.course || body.categoryId;
+    if (courseId) {
+      const course = await resolveCourse(courseId);
+      if (!course) return res.status(400).json({ message: 'Invalid course selected' });
+    }
+
+    const project = new Project();
+    applyProjectFields(project, body, { creating: true });
+
+    if (uploads.software || uploads.guide) {
       project.softwareStatus = 'active';
       if (!project.softwareSaleMode) project.softwareSaleMode = 'included';
     }
@@ -755,11 +709,8 @@ export const createProject = async (req, res) => {
     syncDerivedFields(project, body);
 
     const validationErrors = validateProjectForStatus({
-      data: {
-        ...project.toJSON(),
-        documentationPrice: project.documentationPrice
-      },
-      status,
+      data: { ...project.toJSON(), documentationPrice: project.documentationPrice },
+      status: normalizeStatus(project.status) || 'draft',
       hasDocumentationFile: Boolean(uploads.documentation),
       hasInstaller: Boolean(uploads.software),
       softwareEnabled: hasActiveSoftware(project)
@@ -776,17 +727,17 @@ export const createProject = async (req, res) => {
       thumbnailName = await storePublicThumbnail(uploads.thumbnail);
     }
 
-    transaction = await sequelize.transaction();
+    transaction = await startDbTransaction();
 
-    await project.save({ transaction });
+    await project.save({ session: transaction.session });
 
     if (uploads.documentation) {
       const record = await storeProjectFile({
-        projectId: project.id,
+        projectId: project._id || project.id,
         category: 'documentation',
         file: uploads.documentation,
         createdBy: req.user?.id,
-        transaction
+        session: transaction.session
       });
       uploadedKeys.push(record.storageKey);
       project.documentationFile = record.fileName;
@@ -794,11 +745,11 @@ export const createProject = async (req, res) => {
 
     if (uploads.software) {
       const record = await storeProjectFile({
-        projectId: project.id,
+        projectId: project._id || project.id,
         category: 'software',
         file: uploads.software,
         createdBy: req.user?.id,
-        transaction
+        session: transaction.session
       });
       uploadedKeys.push(record.storageKey);
       project.softwareFile = record.fileName;
@@ -806,22 +757,22 @@ export const createProject = async (req, res) => {
 
     if (uploads.guide) {
       const record = await storeProjectFile({
-        projectId: project.id,
+        projectId: project._id || project.id,
         category: 'guide',
         file: uploads.guide,
         createdBy: req.user?.id,
-        transaction
+        session: transaction.session
       });
       uploadedKeys.push(record.storageKey);
     }
 
     if (thumbnailName) project.thumbnail = thumbnailName;
 
-    await project.save({ transaction });
+    await project.save({ session: transaction.session });
     await transaction.commit();
     transaction = null;
 
-    return await respondWithProject(res, project.id, 201, 'Project created successfully', {
+    return await respondWithProject(res, project._id || project.id, 201, 'Project created successfully', {
       includeSuperseded: true,
       includeStorage: true
     });
@@ -849,7 +800,7 @@ export const updateProject = async (req, res) => {
   let thumbnailName = null;
 
   try {
-    const project = await Project.findByPk(req.params.id);
+    const project = await Project.findByIdOrLegacy(req.params.id);
     if (!project) return res.status(404).json({ message: 'Project not found' });
 
     const body = req.body;
@@ -870,7 +821,6 @@ export const updateProject = async (req, res) => {
       if (!course) return res.status(400).json({ message: 'Invalid course selected' });
     }
 
-    // A status change goes through the lifecycle rules.
     const requestedStatus = normalizeStatus(body.status);
     if (requestedStatus && requestedStatus !== normalizeStatus(project.status) && !canTransition(project.status, requestedStatus)) {
       return res.status(400).json({
@@ -889,16 +839,10 @@ export const updateProject = async (req, res) => {
 
     syncDerivedFields(project, body);
 
-    // A replacement documentation file satisfies the documentation requirement.
     const docWillExist = Boolean(uploads.documentation) || await documentationAvailable(project.id, project.documentationFile);
     const installerWillExist = Boolean(uploads.software) || await softwareAvailable(project.id, project.softwareFile);
 
-    const statusChanged =
-      requestedStatus && requestedStatus !== normalizeStatus(project.status);
-    // Publication invariants are only re-checked when the save actually moves
-    // the resource through the workflow or changes what is on sale. Editing a
-    // title or replacing a file on a published project must not be blocked by
-    // legacy metadata that predates these rules.
+    const statusChanged = requestedStatus && requestedStatus !== normalizeStatus(project.status);
     const publicationSensitive =
       statusChanged ||
       (requestedStatus === 'published' &&
@@ -928,15 +872,15 @@ export const updateProject = async (req, res) => {
       thumbnailName = await storePublicThumbnail(uploads.thumbnail);
     }
 
-    transaction = await sequelize.transaction();
+    transaction = await startDbTransaction();
 
     if (uploads.documentation) {
       const record = await storeProjectFile({
-        projectId: project.id,
+        projectId: project._id || project.id,
         category: 'documentation',
         file: uploads.documentation,
         createdBy: req.user?.id,
-        transaction
+        session: transaction.session
       });
       uploadedKeys.push(record.storageKey);
       project.documentationFile = record.fileName;
@@ -944,11 +888,11 @@ export const updateProject = async (req, res) => {
 
     if (uploads.software) {
       const record = await storeProjectFile({
-        projectId: project.id,
+        projectId: project._id || project.id,
         category: 'software',
         file: uploads.software,
         createdBy: req.user?.id,
-        transaction
+        session: transaction.session
       });
       uploadedKeys.push(record.storageKey);
       project.softwareFile = record.fileName;
@@ -956,18 +900,18 @@ export const updateProject = async (req, res) => {
 
     if (uploads.guide) {
       const record = await storeProjectFile({
-        projectId: project.id,
+        projectId: project._id || project.id,
         category: 'guide',
         file: uploads.guide,
         createdBy: req.user?.id,
-        transaction
+        session: transaction.session
       });
       uploadedKeys.push(record.storageKey);
     }
 
     if (thumbnailName) project.thumbnail = thumbnailName;
 
-    await project.save({ transaction });
+    await project.save({ session: transaction.session });
     await transaction.commit();
     transaction = null;
 
@@ -975,7 +919,7 @@ export const updateProject = async (req, res) => {
       await deletePublicThumbnail(previousThumbnail);
     }
 
-    return await respondWithProject(res, project.id, 200, 'Project updated successfully', {
+    return await respondWithProject(res, project._id || project.id, 200, 'Project updated successfully', {
       includeSuperseded: true,
       includeStorage: true
     });
@@ -1001,7 +945,7 @@ export const updateProjectStatus = async (req, res) => {
       });
     }
 
-    const project = await Project.findByPk(req.params.id);
+    const project = await Project.findByIdOrLegacy(req.params.id);
     if (!project) return res.status(404).json({ message: 'Project not found' });
 
     if (!canTransition(project.status, requested)) {
@@ -1020,7 +964,7 @@ export const updateProjectStatus = async (req, res) => {
     project.status = requested;
     await project.save();
 
-    return await respondWithProject(res, project.id, 200, `Project ${requested.replace('_', ' ')}`, {
+    return await respondWithProject(res, project._id || project.id, 200, `Project ${requested.replace('_', ' ')}`, {
       includeSuperseded: true,
       includeStorage: true
     });
@@ -1032,13 +976,9 @@ export const updateProjectStatus = async (req, res) => {
 
 const DIRECT_UPLOAD_CATEGORIES = ['documentation', 'software', 'guide'];
 
-/**
- * Step 1 of a direct-to-R2 upload: validate declared metadata and hand the
- * admin a short-lived presigned PUT URL. Credentials never leave the backend.
- */
 export const presignProjectFileUpload = async (req, res) => {
   try {
-    const project = await Project.findByPk(req.params.id);
+    const project = await Project.findByIdOrLegacy(req.params.id);
     if (!project) return res.status(404).json({ message: 'Project not found' });
 
     const category = String(req.body.category || '').trim();
@@ -1052,8 +992,6 @@ export const presignProjectFileUpload = async (req, res) => {
       });
     }
 
-    // Local/demo deployments have no object storage to PUT to: tell the client
-    // to use the classic multipart endpoint instead, so uploads keep working.
     if (getStorageProvider() !== 's3') {
       return res.json({
         success: true,
@@ -1079,15 +1017,11 @@ export const presignProjectFileUpload = async (req, res) => {
   }
 };
 
-/**
- * Step 2: the browser has PUT the bytes straight to R2. Verify the object
- * (existence, size, real signature) before making it the current file.
- */
 export const completeProjectFileUpload = async (req, res) => {
   let transaction;
 
   try {
-    const project = await Project.findByPk(req.params.id);
+    const project = await Project.findByIdOrLegacy(req.params.id);
     if (!project) return res.status(404).json({ message: 'Project not found' });
 
     const category = String(req.body.category || '').trim();
@@ -1107,7 +1041,7 @@ export const completeProjectFileUpload = async (req, res) => {
       });
     }
 
-    transaction = await sequelize.transaction();
+    transaction = await startDbTransaction();
 
     const { record } = await finalizeUpload({
       projectId: project.id,
@@ -1117,7 +1051,7 @@ export const completeProjectFileUpload = async (req, res) => {
       mimeType: req.body.mimeType,
       size: req.body.size ?? req.body.fileSize,
       createdBy: req.user?.id,
-      transaction
+      session: transaction.session
     });
 
     if (category === 'documentation') project.documentationFile = record.fileName;
@@ -1127,7 +1061,7 @@ export const completeProjectFileUpload = async (req, res) => {
       if (!project.softwareSaleMode) project.softwareSaleMode = 'included';
     }
 
-    await project.save({ transaction });
+    await project.save({ session: transaction.session });
     await transaction.commit();
     transaction = null;
 
@@ -1156,29 +1090,29 @@ export const uploadProjectDocumentation = async (req, res) => {
   const uploadedKeys = [];
 
   try {
-    const project = await Project.findByPk(req.params.id);
+    const project = await Project.findByIdOrLegacy(req.params.id);
     if (!project) return res.status(404).json({ message: 'Project not found' });
 
     const file = firstFile(req.files, DOCUMENTATION_FIELDS);
     assertUpload(file, 'documentation');
     if (!file) return res.status(400).json({ message: 'Documentation file is required' });
 
-    transaction = await sequelize.transaction();
+    transaction = await startDbTransaction();
     const record = await storeProjectFile({
-      projectId: project.id,
+      projectId: project._id || project.id,
       category: 'documentation',
       file,
       createdBy: req.user?.id,
-      transaction
+      session: transaction.session
     });
     uploadedKeys.push(record.storageKey);
 
     project.documentationFile = record.fileName;
-    await project.save({ transaction });
+    await project.save({ session: transaction.session });
     await transaction.commit();
     transaction = null;
 
-    const saved = await ProjectDocumentFile.findByPk(record.id);
+    const saved = await ProjectDocumentFile.findById(record._id);
     return res.status(201).json({
       message: 'Documentation uploaded successfully',
       file: serializeFile(saved, { includeStorage: true })
@@ -1200,7 +1134,7 @@ export const uploadProjectSoftware = async (req, res) => {
   const uploadedKeys = [];
 
   try {
-    const project = await Project.findByPk(req.params.id);
+    const project = await Project.findByIdOrLegacy(req.params.id);
     if (!project) return res.status(404).json({ message: 'Project not found' });
 
     const body = req.body;
@@ -1228,15 +1162,15 @@ export const uploadProjectSoftware = async (req, res) => {
       return res.status(400).json({ message: 'Software price must be greater than 0 when sold separately' });
     }
 
-    transaction = await sequelize.transaction();
+    transaction = await startDbTransaction();
 
     if (uploads.software) {
       const record = await storeProjectFile({
-        projectId: project.id,
+        projectId: project._id || project.id,
         category: 'software',
         file: uploads.software,
         createdBy: req.user?.id,
-        transaction
+        session: transaction.session
       });
       uploadedKeys.push(record.storageKey);
       project.softwareFile = record.fileName;
@@ -1244,20 +1178,20 @@ export const uploadProjectSoftware = async (req, res) => {
 
     if (uploads.guide) {
       const record = await storeProjectFile({
-        projectId: project.id,
+        projectId: project._id || project.id,
         category: 'guide',
         file: uploads.guide,
         createdBy: req.user?.id,
-        transaction
+        session: transaction.session
       });
       uploadedKeys.push(record.storageKey);
     }
 
-    await project.save({ transaction });
+    await project.save({ session: transaction.session });
     await transaction.commit();
     transaction = null;
 
-    return await respondWithProject(res, project.id, 200, 'Software details saved successfully', {
+    return await respondWithProject(res, project._id || project.id, 200, 'Software details saved successfully', {
       includeSuperseded: true,
       includeStorage: true
     });
@@ -1275,22 +1209,18 @@ export const uploadProjectSoftware = async (req, res) => {
 
 export const archiveProjectSoftware = async (req, res) => {
   try {
-    const project = await Project.findByPk(req.params.id);
+    const project = await Project.findByIdOrLegacy(req.params.id);
     if (!project) return res.status(404).json({ message: 'Project not found' });
 
     if (!hasActiveSoftware(project) && project.softwareStatus !== 'archived') {
       return res.status(400).json({ message: 'This project has no active software to archive' });
     }
 
-    // Archiving never deletes the installer or the user guide: existing
-    // purchases keep working and the software can be restored later.
-    await sequelize.transaction(async (transaction) => {
-      project.softwareStatus = 'archived';
-      project.projectType = 'documentation';
-      await project.save({ transaction });
-    });
+    project.softwareStatus = 'archived';
+    project.projectType = 'documentation';
+    await project.save();
 
-    return await respondWithProject(res, project.id, 200, 'Software archived successfully', {
+    return await respondWithProject(res, project._id || project.id, 200, 'Software archived successfully', {
       includeSuperseded: true,
       includeStorage: true
     });
@@ -1302,11 +1232,11 @@ export const archiveProjectSoftware = async (req, res) => {
 
 export const getProjectFileList = async (req, res) => {
   try {
-    const project = await Project.findByPk(req.params.id);
+    const project = await Project.findByIdOrLegacy(req.params.id);
     if (!project) return res.status(404).json({ message: 'Project not found' });
 
     const includeSuperseded = req.query.includeSuperseded !== 'false';
-    const files = await listProjectFiles(project.id, { includeSuperseded });
+    const files = await listProjectFiles(project._id || project.id, { includeSuperseded });
 
     res.json({
       success: true,
@@ -1320,18 +1250,29 @@ export const getProjectFileList = async (req, res) => {
 
 export const deleteProject = async (req, res) => {
   try {
-    const project = await Project.findByPk(req.params.id, {
-      include: [
-        { model: OrderItem, as: 'orderItems', attributes: ['id'] },
-        { model: SupportRequest, as: 'supportRequests', attributes: ['id'] },
-        { model: ProjectDocumentFile, as: 'documentFiles', attributes: ['id', 'storageKey'] }
-      ]
-    });
-
+    const project = await Project.findByIdOrLegacy(req.params.id);
     if (!project) return res.status(404).json({ message: 'Project not found' });
 
-    const orderItemsCount = project.orderItems?.length || 0;
-    const supportRequestsCount = project.supportRequests?.length || 0;
+    const targetProjectIds = [
+      project._id,
+      project.id,
+      ...(project.legacyId ? [project.legacyId] : [])
+    ];
+
+    const [orderItemsCount, supportRequestsCount, files] = await Promise.all([
+      Order.countDocuments({
+        'items.project': { $in: targetProjectIds }
+      }),
+      SupportRequest.countDocuments({
+        project: { $in: targetProjectIds }
+      }),
+      ProjectDocumentFile.find({
+        $or: [
+          { project: project._id },
+          ...(project.legacyId ? [{ projectIdLegacy: project.legacyId }] : [])
+        ]
+      })
+    ]);
 
     if (orderItemsCount > 0 || supportRequestsCount > 0) {
       return res.status(400).json({
@@ -1343,11 +1284,24 @@ export const deleteProject = async (req, res) => {
       });
     }
 
-    // Objects are removed only after the database delete succeeds.
-    const storageKeys = (project.documentFiles || []).map((file) => file.storageKey).filter(Boolean);
+    const storageKeys = files.map((file) => file.storageKey).filter(Boolean);
     const thumbnail = project.thumbnail;
 
-    await project.destroy();
+    await Promise.all([
+      ProjectDocumentFile.deleteMany({
+        $or: [
+          { project: project._id },
+          ...(project.legacyId ? [{ projectIdLegacy: project.legacyId }] : [])
+        ]
+      }),
+      ProjectDocument.deleteMany({
+        $or: [
+          { project: project._id },
+          ...(project.legacyId ? [{ projectIdLegacy: project.legacyId }] : [])
+        ]
+      }),
+      Project.deleteOne({ _id: project._id })
+    ]);
 
     await Promise.all(storageKeys.map((key) => deleteObject(key).catch(() => {})));
     if (thumbnail) await deletePublicThumbnail(thumbnail);
@@ -1355,21 +1309,13 @@ export const deleteProject = async (req, res) => {
     res.json({ message: 'Project deleted successfully' });
   } catch (error) {
     console.error('Delete project error:', error);
-
-    if (error.name === 'SequelizeForeignKeyConstraintError') {
-      return res.status(400).json({
-        message: 'Cannot delete project. This project is referenced by orders or support requests.',
-        error: 'Foreign key constraint violation'
-      });
-    }
-
     res.status(500).json({ message: 'Server error deleting project', error: error.message });
   }
 };
 
 export const getAllCategories = async (req, res) => {
   try {
-    const categories = await ProjectCategory.findAll({ order: [['name', 'ASC']] });
+    const categories = await ProjectCategory.find().sort({ name: 1 });
     res.json({ categories });
   } catch (error) {
     console.error('Get categories error:', error);

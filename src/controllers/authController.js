@@ -46,15 +46,16 @@ export const register = async (req, res) => {
     }
 
     const { name, email, password } = req.body;
+    const normalizedEmail = String(email || '').trim().toLowerCase();
 
-    const existingUser = await User.findOne({ where: { email } });
+    const existingUser = await User.findOne({ email: normalizedEmail });
     if (existingUser) {
       return res.status(400).json({ message: 'User already exists' });
     }
 
     const user = await User.create({
       name,
-      email,
+      email: normalizedEmail,
       password,
       role: 'student',
       emailVerified: false
@@ -82,8 +83,9 @@ export const login = async (req, res) => {
     }
 
     const { email, password } = req.body;
+    const normalizedEmail = String(email || '').trim().toLowerCase();
 
-    const user = await User.findOne({ where: { email } });
+    const user = await User.findOne({ email: normalizedEmail });
     if (!user) {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
@@ -93,7 +95,8 @@ export const login = async (req, res) => {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
-    if (!user.emailVerified) {
+    // Only block sign in if email is unverified AND a verification token exists (or user registered under the verification workflow)
+    if (user.emailVerified === false && user.verificationToken) {
       return res.status(403).json({
         message: 'Please verify your email before signing in. Check your inbox for the verification link.',
         code: 'EMAIL_NOT_VERIFIED'
@@ -115,6 +118,7 @@ export const login = async (req, res) => {
     });
   } catch (error) {
     console.error('Login error:', error);
+    console.error('Login error stack:', error.stack);
     res.status(500).json({ message: 'Server error during login' });
   }
 };
@@ -128,7 +132,7 @@ export const verifyEmail = async (req, res) => {
 
     const { token } = req.body;
     const user = await User.findOne({
-      where: { verificationToken: hashToken(token) }
+      verificationToken: hashToken(token)
     });
 
     if (!user) {
@@ -151,10 +155,6 @@ export const verifyEmail = async (req, res) => {
     }
 
     user.emailVerified = true;
-    // Keep the token fields on purpose: a second click on the same link then
-    // hits the "already verified" branch above (idempotent UX) instead of
-    // "invalid link". The raw token only exists in this user's own email, and
-    // verification grants nothing extra — resend regenerates the hash anyway.
     await user.save();
 
     res.json({ message: 'Email verified successfully. You can now sign in.' });
@@ -172,13 +172,13 @@ export const resendVerification = async (req, res) => {
     }
 
     const { email } = req.body;
+    const normalizedEmail = String(email || '').trim().toLowerCase();
 
-    // Generic response always — never reveal whether an account exists
     const genericResponse = {
       message: 'If that email is registered and unverified, a new verification link has been sent.'
     };
 
-    const user = await User.findOne({ where: { email } });
+    const user = await User.findOne({ email: normalizedEmail });
     if (user && !user.emailVerified) {
       const { verificationUrl, exposeLinkInDev } = await issueVerification(user);
       if (exposeLinkInDev) {
@@ -195,10 +195,7 @@ export const resendVerification = async (req, res) => {
 
 export const getMe = async (req, res) => {
   try {
-    const user = await User.findByPk(req.user.id, {
-      attributes: { exclude: ['password'] }
-    });
-
+    const user = await User.findByIdOrLegacy(req.user.id).select('-password');
     res.json({ user });
   } catch (error) {
     console.error('Get me error:', error);

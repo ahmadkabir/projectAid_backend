@@ -1,10 +1,8 @@
+import mongoose from 'mongoose';
 import { validationResult } from 'express-validator';
-import { Op } from 'sequelize';
 import {
   Order,
-  OrderItem,
   Project,
-  ProjectCategory,
   ProjectDocumentFile,
   User
 } from '../models/index.js';
@@ -24,56 +22,73 @@ import {
   verifyWebhookSignature
 } from '../services/paystackService.js';
 
-const projectInclude = {
-  model: Project,
-  as: 'project',
-  include: [
-    { model: ProjectCategory, as: 'category' },
-    {
-      model: ProjectDocumentFile,
-      as: 'documentFiles',
-      attributes: [
-        'id', 'projectId', 'fileName', 'originalName', 'category', 'fileType',
-        'mimeType', 'fileSize', 'uploadStatus', 'isCurrent', 'createdAt'
-      ]
-    }
-  ]
-};
+const loadOrderWithDetails = async (orderId) => {
+  const order = await Order.findByIdOrLegacy(orderId)
+    .populate('user', 'id name email profileImage')
+    .populate({
+      path: 'items.project',
+      populate: { path: 'category' }
+    });
 
-const findOrderForResponse = (orderId) =>
-  Order.findByPk(orderId, {
-    include: [{ model: OrderItem, as: 'items', include: [projectInclude] }]
-  });
+  if (!order) return null;
+
+  const orderDoc = order.toJSON();
+
+  for (const item of orderDoc.items || []) {
+    if (item.project && item.project._id) {
+      const files = await ProjectDocumentFile.find({
+        $or: [
+          { project: item.project._id },
+          ...(item.project.legacyId ? [{ projectIdLegacy: item.project.legacyId }] : [])
+        ],
+        uploadStatus: { $ne: 'failed' }
+      }).sort({ createdAt: -1 });
+
+      item.project.documentFiles = files.map((f) => f.toJSON());
+    }
+  }
+
+  return orderDoc;
+};
 
 /**
  * Complete an order exactly once. The conditional update means both the
  * callback verification and the webhook can race safely.
  */
 const markOrderPaid = async (order, reference) => {
-  await Order.update(
+  await Order.updateOne(
+    { _id: order._id || order.id, status: 'pending' },
     {
-      status: 'completed',
-      paymentMethod: 'paystack',
-      transactionId: reference
-    },
-    { where: { id: order.id, status: 'pending' } }
+      $set: {
+        status: 'completed',
+        paymentMethod: 'paystack',
+        transactionId: reference
+      }
+    }
   );
 
-  return findOrderForResponse(order.id);
+  return loadOrderWithDetails(order._id || order.id);
 };
 
 const paymentCallbackUrl = () =>
   process.env.PAYSTACK_CALLBACK_URL ||
   `${(process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '')}/payment/callback`;
 
-const loadProjectWithFiles = (projectId) =>
-  Project.findByPk(projectId, {
-    include: [{
-      model: ProjectDocumentFile,
-      as: 'documentFiles',
-      attributes: ['id', 'category', 'isCurrent', 'uploadStatus']
-    }]
+const loadProjectWithFiles = async (projectId) => {
+  const project = await Project.findByIdOrLegacy(projectId).populate('category');
+  if (!project) return null;
+
+  const projectDoc = project.toJSON();
+  const files = await ProjectDocumentFile.find({
+    $or: [
+      { project: project._id },
+      ...(project.legacyId ? [{ projectIdLegacy: project.legacyId }] : [])
+    ]
   });
+
+  projectDoc.documentFiles = files.map((f) => f.toJSON());
+  return projectDoc;
+};
 
 const fileAvailability = (project) => {
   const files = project.documentFiles || [];
@@ -88,8 +103,7 @@ const fileAvailability = (project) => {
 };
 
 /**
- * Add the files a customer is entitled to for each purchased item. Only files
- * covered by that item's purchase are returned.
+ * Add the files a customer is entitled to for each purchased item.
  */
 const decorateOrder = (order, { includeStorage = false } = {}) => {
   if (!order) return order;
@@ -139,7 +153,6 @@ export const createOrder = async (req, res) => {
         return res.status(404).json({ message: `Project ${item.projectId} not found` });
       }
 
-      // Drafts, resources under review and archived resources cannot be bought.
       if (normalizeStatus(project.status) !== 'published') {
         return res.status(400).json({ message: 'This project is not available for purchase' });
       }
@@ -153,30 +166,21 @@ export const createOrder = async (req, res) => {
 
       totalAmount += resolved.price;
       orderItems.push({
-        projectId: project.id,
+        project: project._id || project.id,
+        projectIdLegacy: project.legacyId || undefined,
         itemType: item.itemType,
         price: resolved.price
       });
     }
 
     const order = await Order.create({
-      userId: req.user.id,
+      user: req.user._id || req.user.id,
       totalAmount,
-      status: 'pending'
+      status: 'pending',
+      items: orderItems
     });
 
-    for (const item of orderItems) {
-      await OrderItem.create({
-        orderId: order.id,
-        projectId: item.projectId,
-        itemType: item.itemType,
-        price: item.price
-      });
-    }
-
-    const createdOrder = await Order.findByPk(order.id, {
-      include: [{ model: OrderItem, as: 'items', include: [projectInclude] }]
-    });
+    const createdOrder = await loadOrderWithDetails(order._id);
 
     res.status(201).json({
       message: 'Order created successfully',
@@ -190,8 +194,6 @@ export const createOrder = async (req, res) => {
 
 export const processPayment = async (req, res) => {
   try {
-    // The mock endpoint lets a client mark its own order as paid. It must
-    // never be available in a real deployment; tests opt in explicitly.
     if (process.env.PAYMENTS_MOCK_ENABLED !== 'true') {
       return res.status(403).json({
         message: 'Mock payments are disabled. Use Paystack checkout.'
@@ -201,15 +203,16 @@ export const processPayment = async (req, res) => {
     const orderId = req.params.id;
     const { paymentMethod, transactionId } = req.body;
 
-    const order = await Order.findByPk(orderId, {
-      include: [{ model: OrderItem, as: 'items' }]
-    });
+    const order = await Order.findByIdOrLegacy(orderId);
 
     if (!order) {
       return res.status(404).json({ message: 'Order not found' });
     }
 
-    if (order.userId !== req.user.id && req.user.role !== 'admin') {
+    const orderUserId = order.user?._id?.toString() || order.user?.toString();
+    const currentUserId = req.user._id?.toString() || req.user.id?.toString();
+
+    if (orderUserId !== currentUserId && req.user.role !== 'admin') {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -222,9 +225,7 @@ export const processPayment = async (req, res) => {
     order.transactionId = transactionId || `TXN-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     await order.save();
 
-    const updatedOrder = await Order.findByPk(order.id, {
-      include: [{ model: OrderItem, as: 'items', include: [projectInclude] }]
-    });
+    const updatedOrder = await loadOrderWithDetails(order._id);
 
     res.json({
       message: 'Payment processed successfully',
@@ -237,8 +238,7 @@ export const processPayment = async (req, res) => {
 };
 
 /**
- * Start a Paystack transaction for a pending order. The amount always comes
- * from the stored order, never from the client.
+ * Start a Paystack transaction for a pending order.
  */
 export const initializePayment = async (req, res) => {
   try {
@@ -246,13 +246,16 @@ export const initializePayment = async (req, res) => {
       return res.status(503).json({ message: 'Payment provider is not configured' });
     }
 
-    const order = await Order.findByPk(req.params.id);
+    const order = await Order.findByIdOrLegacy(req.params.id);
 
     if (!order) {
       return res.status(404).json({ message: 'Order not found' });
     }
 
-    if (order.userId !== req.user.id) {
+    const orderUserId = order.user?._id?.toString() || order.user?.toString();
+    const currentUserId = req.user._id?.toString() || req.user.id?.toString();
+
+    if (orderUserId !== currentUserId) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -275,7 +278,7 @@ export const initializePayment = async (req, res) => {
       currency: paystackCurrency(),
       metadata: {
         orderId: String(order.id),
-        userId: String(order.userId)
+        userId: String(currentUserId)
       }
     });
 
@@ -308,8 +311,15 @@ export const verifyPayment = async (req, res) => {
       return res.status(400).json({ message: 'Payment reference is required' });
     }
 
+    const currentUserId = req.user._id || req.user.id;
+    const userFilters = [{ user: currentUserId }];
+    if (mongoose.Types.ObjectId.isValid(currentUserId)) {
+      userFilters.push({ user: new mongoose.Types.ObjectId(currentUserId) });
+    }
+
     const order = await Order.findOne({
-      where: { transactionId: reference, userId: req.user.id }
+      transactionId: reference,
+      $or: userFilters
     });
 
     if (!order) {
@@ -317,7 +327,7 @@ export const verifyPayment = async (req, res) => {
     }
 
     if (order.status === 'completed') {
-      const completedOrder = await findOrderForResponse(order.id);
+      const completedOrder = await loadOrderWithDetails(order._id);
       return res.json({
         message: 'Payment already verified',
         paymentStatus: 'success',
@@ -383,8 +393,7 @@ export const verifyPayment = async (req, res) => {
 };
 
 /**
- * Paystack webhook. The route receives the raw body so the HMAC signature can
- * be checked before the event is trusted.
+ * Paystack webhook.
  */
 export const paystackWebhook = async (req, res) => {
   const signature = req.get('x-paystack-signature');
@@ -401,7 +410,6 @@ export const paystackWebhook = async (req, res) => {
     return res.status(400).json({ message: 'Invalid webhook payload' });
   }
 
-  // Acknowledge every valid event; only charge.success changes entitlements.
   if (event.event !== 'charge.success') {
     return res.json({ received: true });
   }
@@ -416,10 +424,10 @@ export const paystackWebhook = async (req, res) => {
 
     let order = null;
     if (data.metadata?.orderId) {
-      order = await Order.findByPk(data.metadata.orderId);
+      order = await Order.findByIdOrLegacy(data.metadata.orderId);
     }
     if (!order) {
-      order = await Order.findOne({ where: { transactionId: data.reference } });
+      order = await Order.findOne({ transactionId: data.reference });
     }
 
     if (!order) {
@@ -431,9 +439,10 @@ export const paystackWebhook = async (req, res) => {
       return res.json({ received: true, alreadyProcessed: true });
     }
 
+    const orderUserId = order.user?._id?.toString() || order.user?.toString();
     if (
       data.metadata?.userId &&
-      String(data.metadata.userId) !== String(order.userId)
+      String(data.metadata.userId) !== String(orderUserId)
     ) {
       console.error('Paystack webhook user mismatch:', { orderId: order.id });
       return res.json({ received: true });
@@ -468,13 +477,39 @@ export const paystackWebhook = async (req, res) => {
 
 export const getUserOrders = async (req, res) => {
   try {
-    const orders = await Order.findAll({
-      where: { userId: req.user.id },
-      include: [{ model: OrderItem, as: 'items', include: [projectInclude] }],
-      order: [['createdAt', 'DESC']]
-    });
+    const currentUserId = req.user._id || req.user.id;
+    const userFilters = [{ user: currentUserId }];
+    if (mongoose.Types.ObjectId.isValid(currentUserId)) {
+      userFilters.push({ user: new mongoose.Types.ObjectId(currentUserId) });
+    }
 
-    res.json({ orders: orders.map((order) => decorateOrder(order)) });
+    const orders = await Order.find({ $or: userFilters })
+      .populate('user', 'id name email profileImage')
+      .populate({
+        path: 'items.project',
+        populate: { path: 'category' }
+      })
+      .sort({ createdAt: -1 });
+
+    const decorated = [];
+    for (const order of orders) {
+      const orderDoc = order.toJSON();
+      for (const item of orderDoc.items || []) {
+        if (item.project && item.project._id) {
+          const files = await ProjectDocumentFile.find({
+            $or: [
+              { project: item.project._id },
+              ...(item.project.legacyId ? [{ projectIdLegacy: item.project.legacyId }] : [])
+            ],
+            uploadStatus: { $ne: 'failed' }
+          }).sort({ createdAt: -1 });
+          item.project.documentFiles = files.map((f) => f.toJSON());
+        }
+      }
+      decorated.push(decorateOrder(orderDoc));
+    }
+
+    res.json({ orders: decorated });
   } catch (error) {
     console.error('Get orders error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -485,62 +520,74 @@ export const getAllOrders = async (req, res) => {
   try {
     const { page = 1, limit = 10, search = '', startDate, endDate, status } = req.query;
 
-    const where = {};
+    const query = {};
     if (status && ['pending', 'completed', 'failed'].includes(status)) {
-      where.status = status;
+      query.status = status;
     }
     if (startDate || endDate) {
-      where.createdAt = {};
-      if (startDate) where.createdAt[Op.gte] = new Date(startDate);
+      query.createdAt = {};
+      if (startDate) query.createdAt.$gte = new Date(startDate);
       if (endDate) {
         const end = new Date(endDate);
         end.setHours(23, 59, 59, 999);
-        where.createdAt[Op.lte] = end;
+        query.createdAt.$lte = end;
       }
     }
 
-    const include = [
-      {
-        model: OrderItem,
-        as: 'items',
-        required: false,
-        include: [{ ...projectInclude, required: false }]
-      },
-      {
-        model: User,
-        as: 'user',
-        attributes: ['id', 'name', 'email', 'profileImage'],
-        required: false
-      }
-    ];
-
-    const searchConditions = [];
     if (search) {
-      const like = { [Op.like]: `%${search}%` };
-      searchConditions.push(
-        { transactionId: like },
-        { '$user.name$': like },
-        { '$user.email$': like },
-        { '$items.project.title$': like }
-      );
+      const regex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      const matchingUsers = await User.find({
+        $or: [{ name: regex }, { email: regex }]
+      }).select('_id');
+      const userIds = matchingUsers.map((u) => u._id);
+
+      const matchingProjects = await Project.find({ title: regex }).select('_id');
+      const projectIds = matchingProjects.map((p) => p._id);
+
+      query.$or = [
+        { transactionId: regex },
+        { user: { $in: userIds } },
+        { 'items.project': { $in: projectIds } }
+      ];
     }
 
-    const finalWhere = searchConditions.length ? { ...where, [Op.or]: searchConditions } : where;
+    const pageNum = parseInt(page, 10);
+    const limitNum = parseInt(limit, 10);
+    const skip = (pageNum - 1) * limitNum;
 
-    const { count, rows } = await Order.findAndCountAll({
-      where: finalWhere,
-      include,
-      order: [['createdAt', 'DESC']],
-      limit: parseInt(limit, 10),
-      offset: (parseInt(page, 10) - 1) * parseInt(limit, 10),
-      distinct: true,
-      subQuery: false
-    });
+    const total = await Order.countDocuments(query);
+    const orders = await Order.find(query)
+      .populate('user', 'id name email profileImage')
+      .populate({
+        path: 'items.project',
+        populate: { path: 'category' }
+      })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limitNum);
+
+    const decorated = [];
+    for (const order of orders) {
+      const orderDoc = order.toJSON();
+      for (const item of orderDoc.items || []) {
+        if (item.project && item.project._id) {
+          const files = await ProjectDocumentFile.find({
+            $or: [
+              { project: item.project._id },
+              ...(item.project.legacyId ? [{ projectIdLegacy: item.project.legacyId }] : [])
+            ],
+            uploadStatus: { $ne: 'failed' }
+          }).sort({ createdAt: -1 });
+          item.project.documentFiles = files.map((f) => f.toJSON());
+        }
+      }
+      decorated.push(decorateOrder(orderDoc, { includeStorage: true }));
+    }
 
     res.json({
       success: true,
-      orders: rows.map((order) => decorateOrder(order, { includeStorage: true })),
-      total: count
+      orders: decorated,
+      total
     });
   } catch (error) {
     console.error('Get all orders error:', error);
@@ -550,19 +597,20 @@ export const getAllOrders = async (req, res) => {
 
 export const getOrderById = async (req, res) => {
   try {
-    const order = await Order.findByPk(req.params.id, {
-      include: [{ model: OrderItem, as: 'items', include: [projectInclude] }]
-    });
+    const orderDoc = await loadOrderWithDetails(req.params.id);
 
-    if (!order) {
+    if (!orderDoc) {
       return res.status(404).json({ message: 'Order not found' });
     }
 
-    if (order.userId !== req.user.id && req.user.role !== 'admin') {
+    const orderUserId = orderDoc.user?._id?.toString() || orderDoc.user?.toString() || orderDoc.userId;
+    const currentUserId = req.user._id?.toString() || req.user.id?.toString();
+
+    if (orderUserId !== currentUserId && req.user.role !== 'admin') {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    res.json({ order: decorateOrder(order) });
+    res.json({ order: decorateOrder(orderDoc) });
   } catch (error) {
     console.error('Get order error:', error);
     res.status(500).json({ message: 'Server error' });

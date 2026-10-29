@@ -1,9 +1,9 @@
-import pdf from 'html-pdf';
 import htmlDocx from 'html-docx-js';
-import sequelize from '../config/database.js';
+import { withTransaction } from '../config/mongo.js';
 import { Project, ProjectCategory, ProjectDocument } from '../models/index.js';
 import { generateFreeDocument } from '../utils/freeAIGenerator.js';
 import { storeProjectFile } from '../services/projectFileService.js';
+import { buildPdfFromText } from '../services/watermarkedPdfService.js';
 
 // Initialize OpenAI client (handle case where package might not be installed)
 let OpenAI = null;
@@ -33,6 +33,31 @@ const getOpenAI = async () => {
   }
 };
 
+const findDocumentForProject = async (project) => {
+  const query = {
+    $or: [
+      { project: project._id },
+      ...(project.legacyId ? [{ projectIdLegacy: project.legacyId }] : [])
+    ]
+  };
+  return ProjectDocument.findOne(query);
+};
+
+const upsertDocumentForProject = async (project, content) => {
+  let doc = await findDocumentForProject(project);
+  if (!doc) {
+    doc = new ProjectDocument({
+      project: project._id,
+      projectIdLegacy: project.legacyId || undefined,
+      content
+    });
+  } else {
+    doc.content = content;
+  }
+  await doc.save();
+  return doc;
+};
+
 /**
  * Generate academic document using AI
  */
@@ -40,14 +65,7 @@ export const generateDocument = async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Fetch project with category
-    const project = await Project.findByPk(id, {
-      include: [{
-        model: ProjectCategory,
-        as: 'category',
-        attributes: ['id', 'name']
-      }]
-    });
+    const project = await Project.findByIdOrLegacy(id).populate('category');
 
     if (!project) {
       return res.status(404).json({ message: 'Project not found' });
@@ -57,19 +75,15 @@ export const generateDocument = async (req, res) => {
 
     // Check AI provider mode
     if (AI_PROVIDER === 'free') {
-      // Use FREE AI (template-based generation)
       console.log('Using FREE AI mode for document generation');
       generatedContent = generateFreeDocument(project);
     } else if (AI_PROVIDER === 'openai') {
-      // Use OpenAI API
       const openaiClient = await getOpenAI();
       if (!openaiClient) {
-        // Fallback to FREE AI if OpenAI is not available
         console.warn('OpenAI not available, falling back to FREE AI mode');
         generatedContent = generateFreeDocument(project);
       } else {
         try {
-          // Build the user prompt
           const userPrompt = `Generate a complete academic project documentation using the following details:
 
 Title: ${project.title}
@@ -100,134 +114,79 @@ Use the following Table of Contents STRICTLY and generate full content under eac
 1.1 Background of the Study
 1.2 Statement of the Problem
 1.3 Aim and Objectives of the Study
-1.4 Research Questions
-1.5 Research Hypotheses *(if applicable)*
-1.6 Significance of the Study
-1.7 Scope and Delimitation of the Study
-1.8 Limitations of the Study
-1.9 Definition of Terms
+1.4 Significance of the Study
+1.5 Scope of the Study
+1.6 Limitations of the Study
+1.7 Definition of Terms
 
 ---
 
-### **CHAPTER TWO: REVIEW OF RELATED LITERATURE**
+### **CHAPTER TWO: LITERATURE REVIEW**
 
-2.1 Introduction
-2.2 Conceptual Framework
-   2.2.1 Concept of the Study Variables
-   2.2.2 Overview of the Subject Area
-2.3 Theoretical Framework
-   2.3.1 Relevant Theory/Theories
-2.4 Empirical Review
-2.5 Summary of Literature Review
+2.1 Theoretical Framework
+2.2 Review of Related Works
+2.3 Identified Research Gaps
 
 ---
 
-### **CHAPTER THREE: RESEARCH METHODOLOGY**
+### **CHAPTER THREE: SYSTEM ANALYSIS AND DESIGN**
 
-3.1 Introduction
-3.2 Research Design
-3.3 Area of the Study
-3.4 Population of the Study
-3.5 Sample Size and Sampling Technique
-3.6 Research Instruments
-3.7 Validity of the Instrument
-3.8 Reliability of the Instrument
-3.9 Method of Data Collection
-3.10 Method of Data Analysis
-3.11 Ethical Considerations
+3.1 Analysis of the Existing System
+3.2 Problems of the Existing System
+3.3 Analysis of the Proposed System
+3.4 System Design (Architecture, Modules, Data Flow)
 
 ---
 
-### **CHAPTER FOUR: DATA PRESENTATION, ANALYSIS AND DISCUSSION**
+### **CHAPTER FOUR: SYSTEM IMPLEMENTATION AND TESTING**
 
-4.1 Introduction
-4.2 Data Presentation
-4.3 Analysis of Research Questions
-4.4 Test of Hypotheses *(if applicable)*
-4.5 Discussion of Findings
+4.1 System Requirements (Hardware & Software)
+4.2 Implementation Details
+4.3 Testing and Integration
+4.4 Results and Discussion
 
 ---
 
-### **CHAPTER FIVE: SUMMARY, CONCLUSION AND RECOMMENDATIONS**
+### **CHAPTER FIVE: SUMMARY, CONCLUSION AND RECOMMENDATION**
 
-5.1 Summary of Findings
+5.1 Summary
 5.2 Conclusion
 5.3 Recommendations
-5.4 Suggestions for Further Studies
 
 ---
 
-**References**
+### **REFERENCES**
 
-**Appendices**
-Appendix A: Questionnaire / Interview Guide
-Appendix B: Additional Data
+Generate formal, thorough, academically rigorous content suitable for higher education.`;
 
-
-Rules:
-- Generate VERY DETAILED content
-- Output should be equivalent to NOT LESS THAN 20+ pages
-- Use formal academic English
-- Include tables where appropriate (clearly labeled)
-- Describe diagrams/figures where applicable (e.g. system architecture, workflows)
-- Do NOT fabricate references or data
-- Maintain proper academic tone and numbering
-- Content must be editable (no images, no PDFs)
-- Format the output in plain text with clear headings and structure`;
-
-          const systemPrompt = `You are a senior academic writer specializing in Nigerian Polytechnic and University final year projects.
-
-You write long-form, formal, and well-structured academic documents that strictly follow standard project formats used in ND, HND, BSc, and MSc programs.
-
-Your writing must be detailed, professional, and suitable for direct submission.`;
-
-          // Call OpenAI API
           const completion = await openaiClient.chat.completions.create({
-            model: 'gpt-4o-mini', // Using gpt-4o-mini for cost-effectiveness, can be changed to gpt-4 if needed
+            model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
             messages: [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content: userPrompt }
+              {
+                role: 'system',
+                content: 'You are an academic project supervisor and technical writer with deep expertise in academic research.'
+              },
+              {
+                role: 'user',
+                content: userPrompt
+              }
             ],
             temperature: 0.7,
-            max_tokens: 16000 // Increased for longer documents
+            max_tokens: 16000
           });
 
           generatedContent = completion.choices[0].message.content;
         } catch (openaiError) {
-          // Handle OpenAI API errors (429, quota, etc.) with fallback
           console.warn('OpenAI API error, falling back to FREE AI mode:', openaiError.message);
-          
-          // Check for specific error codes
-          if (openaiError.status === 429 || 
-              openaiError.message?.includes('quota') || 
-              openaiError.message?.includes('insufficient_quota')) {
-            console.log('OpenAI quota exceeded, using FREE AI fallback');
-          }
-          
-          // Fallback to FREE AI
           generatedContent = generateFreeDocument(project);
         }
       }
     } else {
-      // Invalid AI_PROVIDER, default to FREE AI
       console.warn(`Invalid AI_PROVIDER: ${AI_PROVIDER}, using FREE AI mode`);
       generatedContent = generateFreeDocument(project);
     }
 
-    // Save or update document in database
-    const [document, created] = await ProjectDocument.findOrCreate({
-      where: { projectId: id },
-      defaults: {
-        projectId: id,
-        content: generatedContent
-      }
-    });
-
-    if (!created) {
-      // Update existing document
-      document.content = generatedContent;
-      await document.save();
-    }
+    const document = await upsertDocumentForProject(project, generatedContent);
 
     res.json({
       message: 'Document generated successfully',
@@ -241,53 +200,6 @@ Your writing must be detailed, professional, and suitable for direct submission.
     });
   } catch (error) {
     console.error('Generate document error:', error);
-    
-    // Handle OpenAI API errors
-    if (OpenAI && error instanceof OpenAI.APIError) {
-      // Try fallback to FREE AI
-      try {
-        const project = await Project.findByPk(req.params.id, {
-          include: [{
-            model: ProjectCategory,
-            as: 'category',
-            attributes: ['id', 'name']
-          }]
-        });
-        if (project) {
-          const generatedContent = generateFreeDocument(project);
-          // Save the fallback-generated document
-          const [document] = await ProjectDocument.findOrCreate({
-            where: { projectId: req.params.id },
-            defaults: {
-              projectId: req.params.id,
-              content: generatedContent
-            }
-          });
-          if (!document.isNewRecord) {
-            document.content = generatedContent;
-            await document.save();
-          }
-          return res.json({
-            message: 'Document generated successfully (using FREE AI fallback)',
-            document: {
-              id: document.id,
-              projectId: document.projectId,
-              content: document.content,
-              createdAt: document.createdAt,
-              updatedAt: document.updatedAt
-            }
-          });
-        }
-      } catch (fallbackError) {
-        console.error('Fallback generation failed:', fallbackError);
-      }
-      
-      return res.status(500).json({ 
-        message: 'OpenAI API error',
-        error: error.message 
-      });
-    }
-
     res.status(500).json({ 
       message: 'Server error generating document',
       error: error.message 
@@ -301,10 +213,12 @@ Your writing must be detailed, professional, and suitable for direct submission.
 export const getDocument = async (req, res) => {
   try {
     const { id } = req.params;
+    const project = await Project.findByIdOrLegacy(id);
+    if (!project) {
+      return res.status(404).json({ message: 'Project not found' });
+    }
 
-    const document = await ProjectDocument.findOne({
-      where: { projectId: id }
-    });
+    const document = await findDocumentForProject(project);
 
     if (!document) {
       return res.status(404).json({ message: 'Document not found for this project' });
@@ -329,25 +243,12 @@ export const saveDocument = async (req, res) => {
       return res.status(400).json({ message: 'Content is required' });
     }
 
-    // Check if project exists
-    const project = await Project.findByPk(id);
+    const project = await Project.findByIdOrLegacy(id);
     if (!project) {
       return res.status(404).json({ message: 'Project not found' });
     }
 
-    // Save or update document
-    const [document, created] = await ProjectDocument.findOrCreate({
-      where: { projectId: id },
-      defaults: {
-        projectId: id,
-        content: content
-      }
-    });
-
-    if (!created) {
-      document.content = content;
-      await document.save();
-    }
+    const document = await upsertDocumentForProject(project, content);
 
     res.json({
       message: 'Document saved successfully',
@@ -408,19 +309,28 @@ const generateDocumentFileName = (title = 'project', format = 'pdf') => {
 };
 
 const htmlToDocxBuffer = async (htmlString) => {
-  // html-docx-js@0.3.x exposes asBlob (asBuffer only existed in the unpublished 1.x)
   const blob = htmlDocx.asBlob(htmlString);
   return Buffer.from(await blob.arrayBuffer());
 };
 
-const htmlToPdfBuffer = (htmlString) => {
-  return new Promise((resolve, reject) => {
-    pdf.create(htmlString, { format: 'A4', orientation: 'portrait', border: '20mm' }).toBuffer((err, buffer) => {
-      if (err) {
-        return reject(err);
-      }
-      resolve(buffer);
-    });
+/**
+ * PDF export uses pdf-lib instead of PhantomJS (html-pdf). PhantomJS is EOL,
+ * ships a ~40 MB binary and spawns a child process, which is unreliable on
+ * serverless platforms. The generated content is the same plain-text/markdown
+ * that the in-app PDF preview already renders.
+ */
+const htmlToPdfBuffer = async (project, rawContent) => {
+  const stampDate = new Date().toLocaleDateString('en-GB', {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric'
+  });
+
+  return buildPdfFromText({
+    title: project?.title || 'Project documentation',
+    text: rawContent,
+    watermark: '',
+    footer: `ProjectAid - Generated documentation - ${stampDate}`
   });
 };
 
@@ -437,18 +347,17 @@ export const saveDocumentFile = async (req, res) => {
       return res.status(400).json({ message: 'Invalid format. Supported formats are pdf and docx' });
     }
 
-    const project = await Project.findByPk(id);
+    const project = await Project.findByIdOrLegacy(id);
     if (!project) {
       return res.status(404).json({ message: 'Project not found' });
     }
 
-    const formattedHtml = formatHtmlForExport(project, content);
     let buffer;
 
     if (format === 'docx') {
-      buffer = await htmlToDocxBuffer(formattedHtml);
+      buffer = await htmlToDocxBuffer(formatHtmlForExport(project, content));
     } else {
-      buffer = await htmlToPdfBuffer(formattedHtml);
+      buffer = await htmlToPdfBuffer(project, content);
     }
 
     const fileName = generateDocumentFileName(project.title, format);
@@ -456,14 +365,12 @@ export const saveDocumentFile = async (req, res) => {
       ? 'application/pdf'
       : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 
-    // Export through the same private storage path as any other documentation:
-    // metadata in MySQL, bytes in object storage, old exports kept as history.
-    const { documentFile, project: savedProject } = await sequelize.transaction(async (transaction) => {
+    const { documentFile, project: savedProject } = await withTransaction(async (session) => {
       const record = await storeProjectFile({
-        projectId: project.id,
+        projectId: project._id || project.id,
         category: 'documentation',
         createdBy: req.user?.id || null,
-        transaction,
+        session,
         file: {
           buffer,
           originalname: fileName,
@@ -473,7 +380,7 @@ export const saveDocumentFile = async (req, res) => {
       });
 
       project.documentationFile = record.fileName;
-      await project.save({ transaction });
+      await project.save({ session });
 
       return { documentFile: record, project };
     });

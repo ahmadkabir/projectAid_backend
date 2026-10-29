@@ -84,10 +84,44 @@ test('offers a single inclusive option when software is included', () => {
   assert.equal(options[0].includesSoftware, true);
 });
 
+test('sells documentation only while a declared software installer is pending', () => {
+  const options = getPurchaseOptions(included, {
+    hasDocumentationFile: true,
+    hasInstaller: false
+  });
+
+  assert.equal(options.length, 1);
+  assert.equal(options[0].type, 'documentation');
+  assert.equal(options[0].includesSoftware, false);
+  assert.equal(options[0].softwarePending, true);
+  assert.match(options[0].description, /installer is uploaded/i);
+
+  const separateOptions = getPurchaseOptions(separate, {
+    hasDocumentationFile: true,
+    hasInstaller: false
+  });
+  assert.deepEqual(separateOptions.map((option) => option.type), ['documentation']);
+});
+
 test('offers separate and bundled options when software is sold separately', () => {
   const options = getPurchaseOptions(separate);
   assert.deepEqual(options.map((option) => option.type), ['documentation', 'software', 'full']);
   assert.equal(options[1].price, 3000);
+});
+
+test('software-only projects advertise only the software option', () => {
+  const softwareOnly = {
+    ...separate,
+    documentationPrice: '0.00',
+    price: '0.00',
+    fullProjectPrice: '0.00'
+  };
+  const options = getPurchaseOptions(softwareOnly, {
+    hasDocumentationFile: false,
+    hasInstaller: true
+  });
+  assert.deepEqual(options.map((option) => option.type), ['software']);
+  assert.equal(options[0].price, 3000);
 });
 
 test('rejects buying included software on its own', () => {
@@ -119,7 +153,7 @@ test('entitlements follow the purchased item and sale mode', () => {
   assert.deepEqual(entitledCategories(separate, 'full'), ['documentation', 'software', 'guide']);
 });
 
-test('publication requires documentation, an installer and a software price', () => {
+test('publication requires documentation and valid software pricing; installer may be pending', () => {
   const base = {
     title: 'Test',
     description: 'Description',
@@ -160,6 +194,54 @@ test('publication requires documentation, an installer and a software price', ()
     softwareEnabled: true
   });
   assert.deepEqual(valid, []);
+
+  const pendingInstaller = validateProjectForStatus({
+    data: {
+      ...base,
+      softwareName: 'Suite',
+      softwareSaleMode: 'included',
+      softwarePrice: 0,
+      softwareRedistributionAllowed: false
+    },
+    status: 'published',
+    hasDocumentationFile: true,
+    hasInstaller: false,
+    softwareEnabled: true
+  });
+  assert.deepEqual(pendingInstaller, []);
+});
+
+test('software-only projects publish without documentation once the installer exists', () => {
+  const data = {
+    title: 'Software only',
+    description: 'Sold as software without documentation',
+    categoryId: 1,
+    level: 'BSc',
+    documentationPrice: 0,
+    price: 0,
+    softwareName: 'Standalone Suite',
+    softwareSaleMode: 'separate',
+    softwarePrice: 500,
+    softwareRedistributionAllowed: false
+  };
+
+  const valid = validateProjectForStatus({
+    data,
+    status: 'published',
+    hasDocumentationFile: false,
+    hasInstaller: true,
+    softwareEnabled: true
+  });
+  assert.deepEqual(valid, []);
+
+  const missingInstaller = validateProjectForStatus({
+    data,
+    status: 'published',
+    hasDocumentationFile: false,
+    hasInstaller: false,
+    softwareEnabled: true
+  });
+  assert.ok(missingInstaller.some((error) => /installer/i.test(error)));
 });
 
 test('legacy software-only records stay editable and publishable', () => {

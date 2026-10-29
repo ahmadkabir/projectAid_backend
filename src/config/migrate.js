@@ -1,4 +1,4 @@
-import sequelize from './database.js';
+import sequelize, { connectionOptions, dbConfig, describeDatabaseTarget } from './database.js';
 import Sequelize from 'sequelize';
 import '../models/index.js'; // Import all models and associations
 import dotenv from 'dotenv';
@@ -7,25 +7,30 @@ dotenv.config();
 
 async function migrate() {
   try {
-    // First, connect without specifying database to create it if it doesn't exist
+    console.log(`Target: ${describeDatabaseTarget()}`);
+    console.log('');
+
+    // First, connect without specifying database to create it if it doesn't exist.
+    // The admin connection needs the same TLS settings as the application one.
     const adminSequelize = new Sequelize(
       '',
-      process.env.DB_USERNAME || 'root',
-      process.env.DB_PASSWORD || '',
-      {
-        host: process.env.DB_HOST || 'localhost',
-        port: process.env.DB_PORT || 3306,
-        dialect: process.env.DB_DIALECT || 'mysql',
-        logging: false
-      }
+      dbConfig.username,
+      dbConfig.password,
+      { ...connectionOptions, logging: false }
     );
 
-    const dbName = process.env.DB_NAME || 'ProjectAid';
-    
-    // Create database if it doesn't exist
-    await adminSequelize.query(`CREATE DATABASE IF NOT EXISTS \`${dbName}\`;`);
-    console.log(`Database '${dbName}' checked/created.`);
-    await adminSequelize.close();
+    const dbName = dbConfig.database;
+
+    // Managed providers may not grant CREATE DATABASE; that is fine as long as
+    // the database already exists, which the next step will confirm.
+    try {
+      await adminSequelize.query(`CREATE DATABASE IF NOT EXISTS \`${dbName}\`;`);
+      console.log(`Database '${dbName}' checked/created.`);
+    } catch (error) {
+      console.warn(`Could not run CREATE DATABASE (continuing if '${dbName}' already exists): ${error.message}`);
+    } finally {
+      await adminSequelize.close().catch(() => {});
+    }
 
     // Now connect to the actual database
     await sequelize.authenticate();
@@ -34,7 +39,11 @@ async function migrate() {
     // Sync all models (this will add new columns if they don't exist)
     await sequelize.sync({ alter: true });
     console.log('Database tables synchronized successfully.');
-    console.log('\nNote: New fields (summary, objective, features) have been added to the projects table.');
+
+    const queryInterface = sequelize.getQueryInterface();
+    const tables = await queryInterface.showAllTables();
+    console.log(`Tables present: ${tables.length}`);
+    console.log('');
 
     await sequelize.close();
     process.exit(0);

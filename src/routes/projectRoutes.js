@@ -78,8 +78,8 @@ router.post(
   [
     body('title').trim().notEmpty().withMessage('Title is required'),
     body('description').trim().notEmpty().withMessage('Description is required'),
-    body('course').optional().isInt().withMessage('Valid course ID is required'),
-    body('categoryId').optional().isInt().withMessage('Valid category ID is required'),
+    body('course').optional().notEmpty().withMessage('Valid course ID is required'),
+    body('categoryId').optional().notEmpty().withMessage('Valid category ID is required'),
     body('level').isIn(['ND', 'HND', 'BSc', 'MSc']).withMessage('Level must be ND, HND, BSc, or MSc'),
     body('institution').optional().trim().isLength({ max: 255 }).withMessage('Institution name must be less than 255 characters'),
     body('price').optional().isFloat({ min: 0 }).withMessage('Price must be a positive number'),
@@ -100,7 +100,7 @@ router.put(
   [
     body('title').optional().trim().notEmpty(),
     body('description').optional().trim().notEmpty(),
-    body('categoryId').optional().isInt(),
+    body('categoryId').optional().notEmpty(),
     body('level').optional().isIn(['ND', 'HND', 'BSc', 'MSc']).withMessage('Level must be ND, HND, BSc, or MSc'),
     body('institution').optional().trim().isLength({ max: 255 }).withMessage('Institution name must be less than 255 characters'),
     body('documentationPrice').optional().isFloat({ min: 0 }),

@@ -20,7 +20,8 @@ const envSize = (name, fallback) => {
 export const MAX_DOCUMENTATION_SIZE = envSize('MAX_DOCUMENTATION_FILE_SIZE', 25 * MB);
 export const MAX_SOFTWARE_SIZE = envSize('MAX_SOFTWARE_FILE_SIZE', 50 * MB);
 export const MAX_GUIDE_SIZE = envSize('MAX_GUIDE_FILE_SIZE', 10 * MB);
-export const MAX_IMAGE_SIZE = envSize('MAX_IMAGE_SIZE', 5 * MB);
+// Keep thumbnails below Vercel's 4.5 MB request-body limit.
+export const MAX_IMAGE_SIZE = envSize('MAX_IMAGE_SIZE', 4 * MB);
 
 const DOC_MIMES = [
   'application/pdf',

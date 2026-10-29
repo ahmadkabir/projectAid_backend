@@ -10,7 +10,7 @@ export const authenticate = async (req, res, next) => {
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findByPk(decoded.userId);
+    const user = await User.findByIdOrLegacy(decoded.userId);
 
     if (!user) {
       return res.status(401).json({ message: 'User not found' });
@@ -37,7 +37,7 @@ export const optionalAuthenticate = async (req, res, next) => {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = await User.findByPk(decoded.userId);
+    req.user = await User.findByIdOrLegacy(decoded.userId);
   } catch {
     req.user = null;
   }

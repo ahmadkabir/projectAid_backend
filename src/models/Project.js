@@ -1,144 +1,196 @@
-import { DataTypes } from 'sequelize';
-import sequelize from '../config/database.js';
-import ProjectCategory from './ProjectCategory.js';
+import mongoose from 'mongoose';
 
-const Project = sequelize.define('Project', {
-  id: {
-    type: DataTypes.INTEGER,
-    primaryKey: true,
-    autoIncrement: true
-  },
-  title: {
-    type: DataTypes.STRING,
-    allowNull: false
-  },
-  description: {
-    type: DataTypes.TEXT,
-    allowNull: false
-  },
-  categoryId: {
-    type: DataTypes.INTEGER,
-    allowNull: false,
-    references: {
-      model: 'project_categories',
-      key: 'id'
+const projectSchema = new mongoose.Schema(
+  {
+    legacyId: {
+      type: Number,
+      index: true
+    },
+    title: {
+      type: String,
+      required: [true, 'Project title is required'],
+      trim: true
+    },
+    description: {
+      type: String,
+      required: [true, 'Project description is required']
+    },
+    category: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'ProjectCategory',
+      required: false,
+      index: true
+    },
+    categoryIdLegacy: {
+      type: Number,
+      index: true
+    },
+    documentationPrice: {
+      type: Number,
+      default: 0
+    },
+    softwarePrice: {
+      type: Number,
+      default: 0
+    },
+    fullProjectPrice: {
+      type: Number,
+      default: 0
+    },
+    documentationFile: {
+      type: String,
+      default: null
+    },
+    softwareFile: {
+      type: String,
+      default: null
+    },
+    thumbnail: {
+      type: String,
+      default: null
+    },
+    summary: {
+      type: String,
+      default: null
+    },
+    objective: {
+      type: String,
+      default: null
+    },
+    features: {
+      type: String,
+      default: null
+    },
+    status: {
+      type: String,
+      default: 'draft'
+    },
+    projectType: {
+      type: String,
+      enum: ['documentation', 'software'],
+      default: 'documentation'
+    },
+    price: {
+      type: Number,
+      default: 0
+    },
+    level: {
+      type: String,
+      enum: ['ND', 'HND', 'BSc', 'MSc', null],
+      default: null
+    },
+    institution: {
+      type: String,
+      default: null
+    },
+    softwareName: {
+      type: String,
+      default: null
+    },
+    softwareVersion: {
+      type: String,
+      default: null
+    },
+    softwareDescription: {
+      type: String,
+      default: null
+    },
+    softwareOperatingSystem: {
+      type: String,
+      default: null
+    },
+    softwareRequirements: {
+      type: String,
+      default: null
+    },
+    softwareLicense: {
+      type: String,
+      default: null
+    },
+    softwareRedistributionAllowed: {
+      type: Boolean,
+      default: null
+    },
+    softwareSaleMode: {
+      type: String,
+      enum: ['included', 'separate', null],
+      default: null
+    },
+    softwareStatus: {
+      type: String,
+      enum: ['active', 'archived', null],
+      default: null
     }
   },
-  documentationPrice: {
-    type: DataTypes.DECIMAL(10, 2),
-    defaultValue: 0.00
-  },
-  softwarePrice: {
-    type: DataTypes.DECIMAL(10, 2),
-    defaultValue: 0.00,
-    comment: 'Price of the software when it is sold separately (0 when included)'
-  },
-  fullProjectPrice: {
-    type: DataTypes.DECIMAL(10, 2),
-    defaultValue: 0.00,
-    comment: 'Optional bundled price for documentation + separately sold software'
-  },
-  documentationFile: {
-    type: DataTypes.STRING,
-    allowNull: true,
-    comment: 'Legacy: file name of the current documentation file. Metadata lives in project_document_files'
-  },
-  softwareFile: {
-    type: DataTypes.STRING,
-    allowNull: true,
-    comment: 'Legacy: file name of the current software installer. Metadata lives in project_document_files'
-  },
-  thumbnail: {
-    type: DataTypes.STRING,
-    allowNull: true
-  },
-  summary: {
-    type: DataTypes.TEXT,
-    allowNull: true,
-    comment: 'Short overview of the project'
-  },
-  objective: {
-    type: DataTypes.TEXT,
-    allowNull: true,
-    comment: 'Project goals and objectives'
-  },
-  features: {
-    type: DataTypes.TEXT,
-    allowNull: true,
-    comment: 'Key features and deliverables (JSON or text)'
-  },
-  status: {
-    type: DataTypes.ENUM('draft', 'pending_review', 'published', 'archived'),
-    defaultValue: 'draft',
-    allowNull: false,
-    comment: 'Lifecycle state: draft, pending_review, published or archived'
-  },
-  projectType: {
-    type: DataTypes.ENUM('documentation', 'software'),
-    allowNull: true,
-    comment: 'documentation = documentation only, software = documentation plus accompanying software'
-  },
-  price: {
-    type: DataTypes.DECIMAL(10, 2),
-    allowNull: true,
-    comment: 'Documentation price (mirrors documentationPrice)'
-  },
-  level: {
-    type: DataTypes.ENUM('ND', 'HND', 'BSc', 'MSc'),
-    allowNull: true,
-    comment: 'Academic level: ND, HND, BSc, or MSc'
-  },
-  institution: {
-    type: DataTypes.STRING(255),
-    allowNull: true,
-    comment: 'Institution name (e.g., Federal Polytechnic, Kano)'
-  },
-  // --- Accompanying software ------------------------------------------------
-  softwareName: {
-    type: DataTypes.STRING(255),
-    allowNull: true
-  },
-  softwareVersion: {
-    type: DataTypes.STRING(64),
-    allowNull: true
-  },
-  softwareDescription: {
-    type: DataTypes.TEXT,
-    allowNull: true
-  },
-  softwareOperatingSystem: {
-    type: DataTypes.TEXT,
-    allowNull: true,
-    comment: 'Supported operating system(s)'
-  },
-  softwareRequirements: {
-    type: DataTypes.TEXT,
-    allowNull: true,
-    comment: 'System requirements'
-  },
-  softwareLicense: {
-    type: DataTypes.TEXT,
-    allowNull: true,
-    comment: 'Licence terms for the software'
-  },
-  softwareRedistributionAllowed: {
-    type: DataTypes.BOOLEAN,
-    allowNull: true,
-    comment: 'Whether the supplier permits the buyer to redistribute the software'
-  },
-  softwareSaleMode: {
-    type: DataTypes.ENUM('included', 'separate'),
-    allowNull: true,
-    comment: 'included = software comes with the documentation purchase, separate = sold on its own'
-  },
-  softwareStatus: {
-    type: DataTypes.ENUM('active', 'archived'),
-    allowNull: true,
-    comment: 'null = no software, active = available, archived = removed from sale'
+  {
+    collection: 'projects',
+    timestamps: true,
+    toJSON: {
+      virtuals: true,
+      transform: (doc, ret) => {
+        ret.id = ret._id.toString();
+        if (ret.category && typeof ret.category === 'object' && ret.category._id) {
+          ret.categoryId = ret.category._id.toString();
+        } else if (ret.category) {
+          ret.categoryId = ret.category.toString();
+        } else if (ret.categoryIdLegacy) {
+          ret.categoryId = ret.categoryIdLegacy;
+        }
+        delete ret.__v;
+        return ret;
+      }
+    },
+    toObject: {
+      virtuals: true,
+      transform: (doc, ret) => {
+        ret.id = ret._id.toString();
+        if (ret.category && typeof ret.category === 'object' && ret.category._id) {
+          ret.categoryId = ret.category._id.toString();
+        } else if (ret.category) {
+          ret.categoryId = ret.category.toString();
+        } else if (ret.categoryIdLegacy) {
+          ret.categoryId = ret.categoryIdLegacy;
+        }
+        delete ret.__v;
+        return ret;
+      }
+    }
   }
-}, {
-  tableName: 'projects',
-  timestamps: true
+);
+
+projectSchema.virtual('categoryId')
+  .get(function () {
+    if (this.category && typeof this.category === 'object' && this.category._id) {
+      return this.category._id.toString();
+    }
+    return this.category ? this.category.toString() : (this.categoryIdLegacy || null);
+  })
+  .set(function (val) {
+    if (mongoose.Types.ObjectId.isValid(val)) {
+      this.category = val;
+    } else if (val) {
+      this.categoryIdLegacy = Number(val);
+    }
+  });
+
+projectSchema.virtual('documentFiles', {
+  ref: 'ProjectDocumentFile',
+  localField: '_id',
+  foreignField: 'project'
 });
+
+projectSchema.statics.findByIdOrLegacy = function (id) {
+  if (!id) return null;
+  if (mongoose.Types.ObjectId.isValid(id) && String(new mongoose.Types.ObjectId(id)) === String(id)) {
+    return this.findById(id);
+  }
+  const numeric = Number(id);
+  if (!Number.isNaN(numeric)) {
+    return this.findOne({ legacyId: numeric });
+  }
+  return this.findById(id);
+};
+
+const Project = mongoose.models.Project || mongoose.model('Project', projectSchema);
 
 export default Project;

@@ -1,10 +1,8 @@
+import './config/env.js';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import dotenv from 'dotenv';
-import path from 'path';
-import { fileURLToPath } from 'url';
 
 import authRoutes from './routes/authRoutes.js';
 import projectRoutes from './routes/projectRoutes.js';
@@ -15,43 +13,39 @@ import analyticsRoutes from './routes/analyticsRoutes.js';
 import documentRoutes from './routes/documentRoutes.js';
 import fileRoutes from './routes/fileRoutes.js';
 import { paystackWebhook } from './controllers/orderController.js';
-
-dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+import { connectDatabase } from './config/mongo.js';
+import { servePublicAsset } from './utils/publicAssets.js';
 
 const app = express();
 
+// Vercel (and most hosts) terminate TLS in front of the app. Without this,
+// express-rate-limit sees the proxy IP for every visitor and X-Forwarded-For
+// validation fails.
+app.set('trust proxy', 1);
+
 // Security middleware
-// crossOriginResourcePolicy: 'cross-origin' so the frontend (localhost:5173)
-// can load images from /uploads served by this API
 app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' },
   crossOriginEmbedderPolicy: false
 }));
 
-// Rate limiting (more lenient in development)
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: process.env.NODE_ENV === 'production' ? 100 : 1000, // Higher limit in development
-  message: 'Too many requests from this IP, please try again later.',
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-app.use('/api/', limiter);
-
-// CORS configuration
-// Vite serves on both localhost and 127.0.0.1 — allow both origins
+// CORS configuration. FRONTEND_URL may be a single origin or a comma-separated
+// list (production domain + Vercel preview deployments).
 const allowedOrigins = [
-  process.env.FRONTEND_URL || 'http://localhost:5173',
+  process.env.FRONTEND_URL,
   'http://localhost:5173',
-  'http://127.0.0.1:5173'
-];
+  'http://127.0.0.1:5173',
+  'http://localhost:5001'
+]
+  .filter(Boolean)
+  .flatMap((value) => String(value).split(','))
+  .map((value) => value.trim().replace(/\/$/, ''))
+  .filter(Boolean);
+
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow non-browser tools (no Origin header) and known frontend origins
-    if (!origin || allowedOrigins.includes(origin)) {
+    // Allow non-browser tools (no Origin header) and known frontend origins.
+    if (!origin || allowedOrigins.includes(origin.replace(/\/$/, ''))) {
       return callback(null, true);
     }
     callback(null, false);
@@ -59,30 +53,73 @@ app.use(cors({
   credentials: true
 }));
 
-// Paystack signs the raw webhook body, so this route must be mounted before
-// the JSON parser. It verifies the HMAC before trusting the event.
-app.post(
-  '/api/payments/paystack/webhook',
-  express.raw({ type: 'application/json', limit: '1mb' }),
-  paystackWebhook
-);
+// Public marketing assets. Served from local disk in development and from
+// R2/S3 in production (express.static is ignored on Vercel).
+app.get('/uploads/thumbnails/:file', servePublicAsset('thumbnails'));
+app.get('/uploads/avatars/:file', servePublicAsset('avatars'));
 
-// Body parsing middleware
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// Public marketing assets only. Paid documentation, software installers and
-// user guides are served exclusively through /api/files/:id/download, which
-// verifies the customer's purchase.
-app.use('/uploads/thumbnails', express.static(path.join(__dirname, '../uploads/thumbnails')));
-app.use('/uploads/avatars', express.static(path.join(__dirname, '../uploads/avatars')));
-
-// Health check
+// Health check — intentionally does not touch the database so it can be used
+// as an uptime probe even while the database is restarting.
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'ProjectAid API is running' });
 });
 
+/**
+ * Connect lazily and at most once per serverless instance.
+ *
+ * A Vercel Function may be reused for many requests (Fluid compute), so the
+ * connection is cached on the module. Concurrent cold-start requests share the
+ * same promise instead of opening several pools.
+ */
+let databasePromise = null;
+
+const ensureDatabase = async (req, res, next) => {
+  try {
+    if (!databasePromise) {
+      databasePromise = connectDatabase().catch((error) => {
+        // Allow the next request to retry after a transient failure.
+        databasePromise = null;
+        throw error;
+      });
+    }
+
+    await databasePromise;
+    return next();
+  } catch (error) {
+    console.error('Database connection failed:', error.message);
+    return res.status(503).json({ message: 'Database is temporarily unavailable' });
+  }
+};
+
+// Paystack signs the raw webhook body, so this route must be mounted before the
+// JSON parser. It verifies the HMAC before trusting the event, and is outside
+// the general rate limiter so provider retries are never throttled.
+app.post(
+  '/api/payments/paystack/webhook',
+  ensureDatabase,
+  express.raw({ type: 'application/json', limit: '1mb' }),
+  paystackWebhook
+);
+
+// Rate limiting (more lenient in development)
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: process.env.NODE_ENV === 'production' ? 100 : 1000, // Higher limit in development
+  message: 'Too many requests from this IP, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false
+});
+app.use('/api/', limiter);
+
+// Body parsing middleware. The 100 KB Express default is too small for a full
+// generated document; Vercel still caps the request at 4.5 MB.
+const bodyLimit = process.env.REQUEST_BODY_LIMIT || '2mb';
+app.use(express.json({ limit: bodyLimit }));
+app.use(express.urlencoded({ extended: true, limit: bodyLimit }));
+
 // API Routes
+app.use('/api', ensureDatabase);
+
 app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes);
 app.use('/api/orders', orderRoutes);
